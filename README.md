@@ -126,6 +126,8 @@ When you execute a pipeline (`C-c C-c` on the arrow block, or `M-x arrow-run`), 
 - **Cyan** — cache hit (skipped)
 - **Red** — error
 
+![arrow](https://github.com/user-attachments/assets/7e163243-ec65-4a64-9cc0-57a3f20ad559)
+
 Keybindings in the `*arrow*` buffer:
 
 | Key | Action |
