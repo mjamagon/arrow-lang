@@ -215,28 +215,3 @@ Python is the primary language (with pickle-based data threading), but blocks ca
 | R | `Rscript` |
 | julia | `julia` |
 | javascript / js | `node` |
-
-## Example: Batch Seizure Analysis
-
-```
-#+begin_src arrow
--- definitions --
-PerSeizure := (LoadH5, LoadExcel, StorePath) > Preprocess > FitModel > Analyze
-
--- primary flow --
-Flow := Imports > Funcs > ListFiles > PerSeizure*
-Flow# > PlotAll
-
--- secondary: feed raw data to Analyze alongside model output --
-PerSeizure.LoadH5 > PerSeizure.Analyze
-#+end_src
-```
-
-This pipeline:
-1. Runs `Imports` and `Funcs` (shared setup)
-2. `ListFiles` produces a list of file-path dicts
-3. `PerSeizure` is mapped over each element — the sub-pipeline runs in parallel per seizure
-4. Within each element, `(LoadH5, LoadExcel, StorePath)` fork in parallel, then merge into a dict for `Preprocess`
-5. The secondary arrow feeds `LoadH5`'s output directly to `Analyze` (merged with the spine input from `FitModel`)
-6. `Flow#` caches everything; re-runs skip unchanged nodes
-7. `PlotAll` receives the collected list of all seizure results
