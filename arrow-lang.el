@@ -170,7 +170,11 @@
         (setq fac (cadr (arrow--expect 'word))))))
     (when (and (arrow--peek) (eq (car (arrow--peek)) 'star))
       (arrow--consume)
-      (setq map-p t))
+      (setq map-p t)
+      ;; ** = collect all intermediate outputs per element
+      (when (and (arrow--peek) (eq (car (arrow--peek)) 'star))
+        (arrow--consume)
+        (setq map-p 'collect)))
     ;; # = cache, ! = force-rerun (mutually exclusive; last wins)
     (while (and (arrow--peek) (memq (car (arrow--peek)) '(hash bang)))
       (if (eq (car (arrow--consume)) 'hash)
@@ -179,7 +183,8 @@
     (let ((flags `(,@(when label `(:label ,label))
                    ,@(when fac   `(:fac   ,fac))
                    ,@(when cache-p '(:cache t))
-                   ,@(when force-p '(:force t)))))
+                   ,@(when force-p '(:force t))
+                   ,@(when (eq map-p 'collect) '(:collect t)))))
       (if map-p
           `(node-map ,name ,@flags)
         `(node ,name ,@flags)))))
@@ -345,17 +350,18 @@ Bound dynamically by arrow--render-src.")
        (list (concat (make-string indent ?\s) "[ " (arrow--node-name ast) suffix " ]"))))
 
     (`(node-map ,name . ,rest)
-     (let* ((suffix (cond ((plist-get rest :cache) "#")
+     (let* ((star-str (if (plist-get rest :collect) "**" "*"))
+            (suffix (cond ((plist-get rest :cache) "#")
                           ((plist-get rest :force) "!")
                           (t "")))
             (mod-def (and arrow--render-defs
                          (assoc name arrow--render-defs))))
        (if (null mod-def)
            ;; No module definition — render as opaque box
-           (list (concat (make-string indent ?\s) "[ " name "*" suffix " ]"))
+           (list (concat (make-string indent ?\s) "[ " name star-str suffix " ]"))
          ;; Expand and render the module sub-pipeline
          (let* ((expanded (arrow--expand (cdr mod-def) arrow--render-defs))
-                (header (concat (make-string indent ?\s) "[ " name "*" suffix " ]"))
+                (header (concat (make-string indent ?\s) "[ " name star-str suffix " ]"))
                 (sub-lines (arrow--render expanded (+ indent 2)))
                 ;; Apply module-internal secondary arrows if any
                 (mod-sec (and arrow--render-module-sec-edges
@@ -441,15 +447,18 @@ Bound dynamically by arrow--render-src.")
 ;; All column arithmetic uses string-width to handle Unicode correctly.
 
 (defun arrow--find-node-row (name lines)
-  "Return index of first line containing [ NAME ], [ NAME* ], [NAME],
-or variants with # or ! suffixes."
+  "Return index of first line containing [ NAME ], [ NAME* ], [ NAME** ],
+[NAME], or variants with # or ! suffixes."
   (let ((patterns (list (concat "[ " name " ]")
                         (concat "[ " name "* ]")
+                        (concat "[ " name "** ]")
                         (concat "[" name "]")
                         (concat "[ " name "# ]")
                         (concat "[ " name "! ]")
                         (concat "[ " name "*# ]")
-                        (concat "[ " name "*! ]")))
+                        (concat "[ " name "*! ]")
+                        (concat "[ " name "**# ]")
+                        (concat "[ " name "**! ]")))
         found)
     (cl-loop for line in lines for i from 0
              when (and (not found)
@@ -461,14 +470,17 @@ or variants with # or ! suffixes."
 
 (defun arrow--node-box-end (name line)
   "Return char position just after the node box for NAME in LINE.
-Matches [ NAME ], [ NAME* ], [NAME], and variants with # or ! suffixes."
+Matches [ NAME ], [ NAME* ], [ NAME** ], [NAME], and variants with # or ! suffixes."
   (let ((patterns (list (concat "[ " name " ]")
                         (concat "[ " name "* ]")
+                        (concat "[ " name "** ]")
                         (concat "[" name "]")
                         (concat "[ " name "# ]")
                         (concat "[ " name "! ]")
                         (concat "[ " name "*# ]")
-                        (concat "[ " name "*! ]"))))
+                        (concat "[ " name "*! ]")
+                        (concat "[ " name "**# ]")
+                        (concat "[ " name "**! ]"))))
     (or (cl-some (lambda (pat)
                    (when (string-match (regexp-quote pat) line)
                      (match-end 0)))
@@ -1104,9 +1116,15 @@ Nil if no :arrow shared blocks exist.  Reset at each pipeline start.")
 try:
     import dill as pickle, hashlib
     paths = [%s]
-    data = [pickle.load(open(p,'rb')) for p in paths]
-    with open(%S,'wb') as f: pickle.dump(data, f)
-    with open(%S,'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+    data = []
+    for p in paths:
+        with open(p, 'rb') as fh:
+            data.append(pickle.load(fh))
+    with open(%S, 'wb') as f:
+        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
+    f = None
+    with open(%S, 'rb') as f:
+        h = hashlib.sha256(f.read()).hexdigest()
     print(%S)
     print(h)
 except Exception:
@@ -1325,6 +1343,39 @@ Calls CALLBACK with (result nil) or (nil err)."
 
 ;;; ─── Parallel map execution ────────────────────────────────────────────
 
+(defun arrow--map-store-collected (name elem-results n callback log-buffer)
+  "Store per-element dict pkls in the inspect dir for ** collect mode.
+NAME is the map node name.  ELEM-RESULTS is a list of per-element
+dict pkl paths.  N is the element count.  Copies each element's dict
+to NAME.0.pkl, NAME.1.pkl, etc., then creates a lightweight index pkl
+so the REPL can detect and load them.  Calls CALLBACK when done."
+  ;; Copy each element's dict pkl to the inspect dir
+  (dotimes (j n)
+    (let ((src (nth j elem-results))
+          (dst (expand-file-name (format "%s.%d.pkl" name j)
+                                 arrow--viz-inspect-dir)))
+      (when (and (stringp src) (file-exists-p src))
+        (ignore-errors (copy-file src dst t)))))
+  ;; Create a lightweight index pkl
+  (let* ((idx-script (make-temp-file "arrow-idx-" nil ".py"))
+         (idx-out    (make-temp-file "arrow-data-" nil ".pkl"))
+         (idx-buf    (generate-new-buffer " *arrow-idx*")))
+    (with-temp-file idx-script
+      (insert (format
+               "import dill as pickle, hashlib\nwith open(%S, 'wb') as f:\n    pickle.dump({'__arrow_collect__': True, 'name': %S, 'count': %d}, f)\nwith open(%S, 'rb') as f:\n    h = hashlib.sha256(f.read()).hexdigest()\nprint(%S)\nprint(h)\n"
+               idx-out name n idx-out idx-out)))
+    (push idx-out arrow--pipeline-tempfiles)
+    (make-process
+     :name    "arrow-idx"
+     :buffer  idx-buf
+     :command (list "python3" idx-script)
+     :sentinel
+     (lambda (proc event)
+       (arrow--merge-sentinel
+        proc event idx-script idx-buf idx-out
+        callback log-buffer
+        (format "%s** -- stored %d element dicts" name n))))))
+
 (defun arrow--exec-map-fork (name input source-buffer log-buffer callback
                             &optional flags)
   "Map block NAME over each element of INPUT in parallel.
@@ -1439,43 +1490,74 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
                           ;; Set up module-internal secondary arrows if any
                           (mod-sec (and sub-ast
                                        arrow--module-secondary-edges
-                                       (gethash name arrow--module-secondary-edges))))
+                                       (gethash name arrow--module-secondary-edges)))
+                          ;; ** = collect all intermediate outputs per element
+                          (collect-p (plist-get flags :collect)))
                      (dotimes (i n)
                        (let ((elem-path (nth i elem-paths))
                              (idx i)
-                             ;; Per-element context for secondary arrows
-                             (elem-ctx (when mod-sec
+                             ;; Per-element context: needed for secondary arrows
+                             ;; OR for collecting intermediate outputs
+                             (elem-ctx (when sub-ast
                                          (arrow--make-map-ctx mod-sec))))
-                         (let ((elem-callback
-                                (lambda (result err)
-                                  (aset results idx result)
-                                  (aset errors  idx err)
-                                  (setcar done-c (1+ (car done-c)))
-                                  (when (functionp arrow--viz-map-hook)
-                                    (funcall arrow--viz-map-hook
-                                             name (car done-c) n))
-                                  (when (= (car done-c) n)
-                                    (let ((first-err (cl-find-if #'identity (append errors nil))))
-                                      (if first-err
-                                          (funcall callback nil first-err)
-                                        (let* ((items        (append results nil))
-                                               (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
-                                               (merge-script (make-temp-file "arrow-mmap-" nil ".py"))
-                                               (paths-repr   (mapconcat (lambda (p) (format "%S" p))
-                                                                         items ", "))
-                                               (mb (generate-new-buffer " *arrow-mmap*")))
-                                          (with-temp-file merge-script
-                                            (insert (arrow--merge-script-body paths-repr merge-out)))
-                                          (push merge-out arrow--pipeline-tempfiles)
-                                          (make-process
-                                           :name    "arrow-mmap-merge"
-                                           :buffer  mb
-                                           :command (list "python3" merge-script)
-                                           :sentinel (lambda (mp mev)
-                                                       (arrow--merge-sentinel
-                                                        mp mev merge-script mb merge-out callback
-                                                        log-buffer
-                                                        (format "%s* -- collected %d results" name n)))))))))))
+                         (let* (;; The "done" callback that feeds into the
+                                ;; normal result-collection and final merge.
+                                (finish-callback
+                                 (lambda (result err)
+                                   (aset results idx result)
+                                   (aset errors  idx err)
+                                   (setcar done-c (1+ (car done-c)))
+                                   (when (functionp arrow--viz-map-hook)
+                                     (funcall arrow--viz-map-hook
+                                              name (car done-c) n))
+                                   (when (= (car done-c) n)
+                                     (let ((first-err (cl-find-if #'identity (append errors nil))))
+                                       (if first-err
+                                           (funcall callback nil first-err)
+                                         (if (and collect-p arrow--viz-inspect-dir)
+                                             ;; Collect mode: store per-element dicts
+                                             ;; individually in inspect dir
+                                             (arrow--map-store-collected
+                                              name (append results nil) n
+                                              callback log-buffer)
+                                           ;; Normal mode: merge into a single list pkl
+                                           (let* ((items        (append results nil))
+                                                  (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
+                                                  (merge-script (make-temp-file "arrow-mmap-" nil ".py"))
+                                                  (paths-repr   (mapconcat (lambda (p) (format "%S" p))
+                                                                            items ", "))
+                                                  (mb (generate-new-buffer " *arrow-mmap*")))
+                                             (with-temp-file merge-script
+                                               (insert (arrow--merge-script-body paths-repr merge-out)))
+                                             (push merge-out arrow--pipeline-tempfiles)
+                                             (make-process
+                                              :name    "arrow-mmap-merge"
+                                              :buffer  mb
+                                              :command (list "python3" merge-script)
+                                              :sentinel (lambda (mp mev)
+                                                          (arrow--merge-sentinel
+                                                           mp mev merge-script mb merge-out callback
+                                                           log-buffer
+                                                           (format "%s* -- collected %d results" name n)))))))))))                                ;; In collect mode, intercept the sub-pipeline result
+                                ;; and replace it with a dict of all intermediate outputs.
+                                (elem-callback
+                                 (if (and collect-p elem-ctx)
+                                     (lambda (result err)
+                                       (if err
+                                           (funcall finish-callback nil err)
+                                         (let ((output-tbl (aref elem-ctx 1)))
+                                           (if (= (hash-table-count output-tbl) 0)
+                                               ;; No outputs recorded — pass through
+                                               (funcall finish-callback result nil)
+                                             ;; Build a dict pkl from the output table
+                                             (let* ((pairs nil))
+                                               (maphash (lambda (k v) (push (cons k v) pairs))
+                                                        output-tbl)
+                                               (setq pairs (nreverse pairs))
+                                               (arrow--run-dict-merge
+                                                pairs finish-callback log-buffer))))))
+                                   ;; Normal mode: pass through directly
+                                   finish-callback)))
                            ;; Defer each element launch via run-at-time so
                            ;; Emacs can process events between elements.
                            ;; Without this, a fully-cached map executes all
@@ -1498,12 +1580,14 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
 (defun arrow--make-map-ctx (sec-edges)
   "Create a per-element execution context for mapped sub-pipelines.
 SEC-EDGES is a list of (source target) pairs for module-internal
-secondary arrows.  Returns a vector:
+secondary arrows, or nil if there are none.  Returns a vector:
   [0] secondary-targets — hash table: target -> list of sources
   [1] output-table      — hash table: node-name -> pkl-path
   [2] spine-pred        — name of last completed spine node (string or nil)
   [3] spine-from-fork   — non-nil when spine input came from a fork"
-  (vector (arrow--build-secondary-targets sec-edges)
+  (vector (if sec-edges
+              (arrow--build-secondary-targets sec-edges)
+            (make-hash-table :test #'equal))
           (make-hash-table :test #'equal)
           nil
           nil))
@@ -1527,7 +1611,7 @@ Calls (callback result nil) or (callback nil err) when done."
                           (plist-get rest :cache) (plist-get rest :force))))
     (`(node-map ,name . ,rest)
      (let ((map-flags (cl-loop for (k v) on rest by #'cddr
-                               when (memq k '(:cache :force))
+                               when (memq k '(:cache :force :collect))
                                append (list k v))))
        (arrow--exec-map-fork name input source-buffer log-buffer callback
                              map-flags)))
@@ -1908,7 +1992,7 @@ Returns a new list of propertized strings."
                 (state  (and arrow--viz-state (gethash name arrow--viz-state)))
                 (face   (if (memq state '(:done :cached)) 'arrow-viz-done 'arrow-viz-running)))
            (dotimes (i nlines)
-             (when (string-match (format "\\[ %s\\*[#!]? \\]"
+             (when (string-match (format "\\[ %s\\*\\*?[#!]? \\]"
                                          (regexp-quote name))
                                  (aref vec i))
                (aset vec i
@@ -1999,7 +2083,7 @@ whether the map node should show :cached or :done.")
                                  (plist-get rest :cache) (plist-get rest :force)))
     (`(node-map ,name . ,rest)
      (let ((map-flags (cl-loop for (k v) on rest by #'cddr
-                               when (memq k '(:cache :force))
+                               when (memq k '(:cache :force :collect))
                                append (list k v))))
        (arrow--viz-wrap-map-fork name input source-buffer log-buffer callback
                                  map-flags)))
@@ -2557,17 +2641,53 @@ injects shared module symbols."
       ;; reload
       (insert "def _reload():\n")
       (insert "    \"\"\"Reload all node outputs from disk into `nodes` dict.\"\"\"\n")
+      (insert "    import re as _re\n")
       (insert "    _load_shared()\n")
       (insert "    d = {}\n")
       (insert "    if _inspect_dir and _os.path.isdir(_inspect_dir):\n")
+      (insert "        # First pass: find collect-mode map nodes (Name.N.pkl files)\n")
+      (insert "        _elem_pat = _re.compile(r'^(.+)\\.([0-9]+)\\.pkl$')\n")
+      (insert "        _collect_names = set()\n")
+      (insert "        for _f in _os.listdir(_inspect_dir):\n")
+      (insert "            _m = _elem_pat.match(_f)\n")
+      (insert "            if _m:\n")
+      (insert "                _collect_names.add(_m.group(1))\n")
+      (insert "        # Load collect-mode nodes as lists of dicts\n")
+      (insert "        for _cn in sorted(_collect_names):\n")
+      (insert "            _elems = []\n")
+      (insert "            _i = 0\n")
+      (insert "            while True:\n")
+      (insert "                _ep = _os.path.join(_inspect_dir, f'{_cn}.{_i}.pkl')\n")
+      (insert "                if not _os.path.exists(_ep):\n")
+      (insert "                    break\n")
+      (insert "                try:\n")
+      (insert "                    with open(_ep, 'rb') as _fh:\n")
+      (insert "                        _elems.append(_pickle.load(_fh))\n")
+      (insert "                except Exception as _e:\n")
+      (insert "                    print(f'  [warn] {_cn}[{_i}]: {_e}')\n")
+      (insert "                    _elems.append(None)\n")
+      (insert "                _i += 1\n")
+      (insert "            if _elems:\n")
+      (insert "                d[_cn] = _elems\n")
+      (insert "        # Second pass: load regular node pkls\n")
       (insert "        for _f in sorted(_glob.glob(_os.path.join(_inspect_dir, '*.pkl'))):\n")
       (insert "            _base = _os.path.basename(_f)\n")
       (insert "            if _base.endswith('.input.pkl'):\n")
       (insert "                continue\n")
+      (insert "            # Skip element sub-files (already loaded above)\n")
+      (insert "            if _elem_pat.match(_base):\n")
+      (insert "                continue\n")
       (insert "            _name = _os.path.splitext(_base)[0]\n")
+      (insert "            # Skip if already loaded as collect-mode\n")
+      (insert "            if _name in _collect_names:\n")
+      (insert "                continue\n")
       (insert "            try:\n")
       (insert "                with open(_f, 'rb') as _fh:\n")
-      (insert "                    d[_name] = _pickle.load(_fh)\n")
+      (insert "                    _val = _pickle.load(_fh)\n")
+      (insert "                # Skip collect marker dicts\n")
+      (insert "                if isinstance(_val, dict) and _val.get('__arrow_collect__'):\n")
+      (insert "                    continue\n")
+      (insert "                d[_name] = _val\n")
       (insert "            except Exception as _e:\n")
       (insert "                print(f'  [warn] {_name}: {_e}')\n")
       (insert "    globals()['nodes'] = d\n")
