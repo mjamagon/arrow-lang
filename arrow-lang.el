@@ -170,11 +170,7 @@
         (setq fac (cadr (arrow--expect 'word))))))
     (when (and (arrow--peek) (eq (car (arrow--peek)) 'star))
       (arrow--consume)
-      (setq map-p t)
-      ;; ** = collect all intermediate outputs per element
-      (when (and (arrow--peek) (eq (car (arrow--peek)) 'star))
-        (arrow--consume)
-        (setq map-p 'collect)))
+      (setq map-p t))
     ;; # = cache, ! = force-rerun (mutually exclusive; last wins)
     (while (and (arrow--peek) (memq (car (arrow--peek)) '(hash bang)))
       (if (eq (car (arrow--consume)) 'hash)
@@ -183,8 +179,7 @@
     (let ((flags `(,@(when label `(:label ,label))
                    ,@(when fac   `(:fac   ,fac))
                    ,@(when cache-p '(:cache t))
-                   ,@(when force-p '(:force t))
-                   ,@(when (eq map-p 'collect) '(:collect t)))))
+                   ,@(when force-p '(:force t)))))
       (if map-p
           `(node-map ,name ,@flags)
         `(node ,name ,@flags)))))
@@ -350,18 +345,17 @@ Bound dynamically by arrow--render-src.")
        (list (concat (make-string indent ?\s) "[ " (arrow--node-name ast) suffix " ]"))))
 
     (`(node-map ,name . ,rest)
-     (let* ((star-str (if (plist-get rest :collect) "**" "*"))
-            (suffix (cond ((plist-get rest :cache) "#")
+     (let* ((suffix (cond ((plist-get rest :cache) "#")
                           ((plist-get rest :force) "!")
                           (t "")))
             (mod-def (and arrow--render-defs
                          (assoc name arrow--render-defs))))
        (if (null mod-def)
            ;; No module definition — render as opaque box
-           (list (concat (make-string indent ?\s) "[ " name star-str suffix " ]"))
+           (list (concat (make-string indent ?\s) "[ " name "*" suffix " ]"))
          ;; Expand and render the module sub-pipeline
          (let* ((expanded (arrow--expand (cdr mod-def) arrow--render-defs))
-                (header (concat (make-string indent ?\s) "[ " name star-str suffix " ]"))
+                (header (concat (make-string indent ?\s) "[ " name "*" suffix " ]"))
                 (sub-lines (arrow--render expanded (+ indent 2)))
                 ;; Apply module-internal secondary arrows if any
                 (mod-sec (and arrow--render-module-sec-edges
@@ -447,18 +441,15 @@ Bound dynamically by arrow--render-src.")
 ;; All column arithmetic uses string-width to handle Unicode correctly.
 
 (defun arrow--find-node-row (name lines)
-  "Return index of first line containing [ NAME ], [ NAME* ], [ NAME** ],
-[NAME], or variants with # or ! suffixes."
+  "Return index of first line containing [ NAME ], [ NAME* ], [NAME],
+or variants with # or ! suffixes."
   (let ((patterns (list (concat "[ " name " ]")
                         (concat "[ " name "* ]")
-                        (concat "[ " name "** ]")
                         (concat "[" name "]")
                         (concat "[ " name "# ]")
                         (concat "[ " name "! ]")
                         (concat "[ " name "*# ]")
-                        (concat "[ " name "*! ]")
-                        (concat "[ " name "**# ]")
-                        (concat "[ " name "**! ]")))
+                        (concat "[ " name "*! ]")))
         found)
     (cl-loop for line in lines for i from 0
              when (and (not found)
@@ -470,17 +461,14 @@ Bound dynamically by arrow--render-src.")
 
 (defun arrow--node-box-end (name line)
   "Return char position just after the node box for NAME in LINE.
-Matches [ NAME ], [ NAME* ], [ NAME** ], [NAME], and variants with # or ! suffixes."
+Matches [ NAME ], [ NAME* ], [NAME], and variants with # or ! suffixes."
   (let ((patterns (list (concat "[ " name " ]")
                         (concat "[ " name "* ]")
-                        (concat "[ " name "** ]")
                         (concat "[" name "]")
                         (concat "[ " name "# ]")
                         (concat "[ " name "! ]")
                         (concat "[ " name "*# ]")
-                        (concat "[ " name "*! ]")
-                        (concat "[ " name "**# ]")
-                        (concat "[ " name "**! ]"))))
+                        (concat "[ " name "*! ]"))))
     (or (cl-some (lambda (pat)
                    (when (string-match (regexp-quote pat) line)
                      (match-end 0)))
@@ -904,6 +892,9 @@ The file is copied to the inspect directory so it persists for the REPL."
     (read-only-mode 1)))
 
 ;;; ─── Interpreter map ────────────────────────────────────────────────────────
+(defvar arrow--map-max-workers 6
+  "Maximum number of concurrent subprocesses spawned by a parallel map fork.
+Can be overridden per-pipeline by the :workers header argument on the arrow block.")
 
 (defvar arrow--interpreters
   '(("python"     . "python3")
@@ -1116,15 +1107,9 @@ Nil if no :arrow shared blocks exist.  Reset at each pipeline start.")
 try:
     import dill as pickle, hashlib
     paths = [%s]
-    data = []
-    for p in paths:
-        with open(p, 'rb') as fh:
-            data.append(pickle.load(fh))
-    with open(%S, 'wb') as f:
-        pickle.dump(data, f, protocol=pickle.HIGHEST_PROTOCOL)
-    f = None
-    with open(%S, 'rb') as f:
-        h = hashlib.sha256(f.read()).hexdigest()
+    data = [pickle.load(open(p,'rb')) for p in paths]
+    with open(%S,'wb') as f: pickle.dump(data, f)
+    with open(%S,'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
     print(%S)
     print(h)
 except Exception:
@@ -1342,50 +1327,17 @@ Calls CALLBACK with (result nil) or (nil err)."
                   (process-put proc :input-path  input)))))))))))
 
 ;;; ─── Parallel map execution ────────────────────────────────────────────
-
-(defun arrow--map-store-collected (name elem-results n callback log-buffer)
-  "Store per-element dict pkls in the inspect dir for ** collect mode.
-NAME is the map node name.  ELEM-RESULTS is a list of per-element
-dict pkl paths.  N is the element count.  Copies each element's dict
-to NAME.0.pkl, NAME.1.pkl, etc., then creates a lightweight index pkl
-so the REPL can detect and load them.  Calls CALLBACK when done."
-  ;; Copy each element's dict pkl to the inspect dir
-  (dotimes (j n)
-    (let ((src (nth j elem-results))
-          (dst (expand-file-name (format "%s.%d.pkl" name j)
-                                 arrow--viz-inspect-dir)))
-      (when (and (stringp src) (file-exists-p src))
-        (ignore-errors (copy-file src dst t)))))
-  ;; Create a lightweight index pkl
-  (let* ((idx-script (make-temp-file "arrow-idx-" nil ".py"))
-         (idx-out    (make-temp-file "arrow-data-" nil ".pkl"))
-         (idx-buf    (generate-new-buffer " *arrow-idx*")))
-    (with-temp-file idx-script
-      (insert (format
-               "import dill as pickle, hashlib\nwith open(%S, 'wb') as f:\n    pickle.dump({'__arrow_collect__': True, 'name': %S, 'count': %d}, f)\nwith open(%S, 'rb') as f:\n    h = hashlib.sha256(f.read()).hexdigest()\nprint(%S)\nprint(h)\n"
-               idx-out name n idx-out idx-out)))
-    (push idx-out arrow--pipeline-tempfiles)
-    (make-process
-     :name    "arrow-idx"
-     :buffer  idx-buf
-     :command (list "python3" idx-script)
-     :sentinel
-     (lambda (proc event)
-       (arrow--merge-sentinel
-        proc event idx-script idx-buf idx-out
-        callback log-buffer
-        (format "%s** -- stored %d element dicts" name n))))))
-
 (defun arrow--exec-map-fork (name input source-buffer log-buffer callback
                             &optional flags)
-  "Map block NAME over each element of INPUT in parallel.
+  "Map block NAME over each element of INPUT in parallel, with a concurrency limit.
 If NAME has a module definition in arrow--pipeline-defs, the expanded
 sub-pipeline is executed per element instead of a single block.
 FLAGS is a plist of :cache/:force flags from the node-map reference site,
 propagated to leaf nodes in expanded sub-pipelines.
 INPUT must be a pickle of a list or any iterable (e.g. numpy array, tuple).
-Spawns one arrow--exec-block per element, collects results in order.
-Fails fast: if any element errors, CALLBACK receives (nil err)."
+Spawns one arrow--exec-block per element (up to arrow--map-max-workers at a time), 
+collects results in order.
+Fails fast: if any element errors, pending elements are cancelled and CALLBACK receives (nil err)."
   (if (not (and (stringp input)
                 (string-suffix-p ".pkl" input)
                 (file-exists-p input)))
@@ -1433,8 +1385,7 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
                                     "[error]")
                    (funcall callback nil
                             (format "%s*: input is not iterable: %s" name output)))
-               (let* ((raw-lines  (split-string output "
-" t))
+               (let* ((raw-lines  (split-string output "\n" t))
                       (elem-paths (mapcar (lambda (line)
                                             (car (split-string line " " t)))
                                           raw-lines))
@@ -1466,7 +1417,8 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
                                      log-buffer
                                      (format "%s* — mapped 0 elements" name)))))
                    (arrow--exec-log log-buffer
-                                    (format "%s* — mapping over %d elements" name n)
+                                    (format "%s* — mapping over %d elements (max %d concurrent)" 
+                                            name n arrow--map-max-workers)
                                     "[map]")
                    ;; Seed progress cookie with 0/n now that we know the total
                    (when (functionp arrow--viz-map-hook)
@@ -1475,104 +1427,81 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
                           (errors  (make-vector n nil))
                           (done-c  (list 0))
                           ;; Check if name has a module def -- if so, expand
-                          ;; and run the sub-pipeline per element
                           (mod-def (and arrow--pipeline-defs
                                        (assoc name arrow--pipeline-defs)))
                           (sub-ast (when mod-def
                                      (let ((expanded (arrow--expand
                                                       (cdr mod-def)
                                                       arrow--pipeline-defs)))
-                                       ;; Propagate cache/force flags from
-                                       ;; the reference site to all leaves
                                        (if flags
                                            (arrow--apply-flags expanded flags)
                                          expanded))))
-                          ;; Set up module-internal secondary arrows if any
                           (mod-sec (and sub-ast
                                        arrow--module-secondary-edges
                                        (gethash name arrow--module-secondary-edges)))
-                          ;; ** = collect all intermediate outputs per element
-                          (collect-p (plist-get flags :collect)))
-                     (dotimes (i n)
-                       (let ((elem-path (nth i elem-paths))
-                             (idx i)
-                             ;; Per-element context: needed for secondary arrows
-                             ;; OR for collecting intermediate outputs
-                             (elem-ctx (when sub-ast
-                                         (arrow--make-map-ctx mod-sec))))
-                         (let* (;; The "done" callback that feeds into the
-                                ;; normal result-collection and final merge.
-                                (finish-callback
-                                 (lambda (result err)
-                                   (aset results idx result)
-                                   (aset errors  idx err)
-                                   (setcar done-c (1+ (car done-c)))
-                                   (when (functionp arrow--viz-map-hook)
-                                     (funcall arrow--viz-map-hook
-                                              name (car done-c) n))
-                                   (when (= (car done-c) n)
-                                     (let ((first-err (cl-find-if #'identity (append errors nil))))
-                                       (if first-err
-                                           (funcall callback nil first-err)
-                                         (if (and collect-p arrow--viz-inspect-dir)
-                                             ;; Collect mode: store per-element dicts
-                                             ;; individually in inspect dir
-                                             (arrow--map-store-collected
-                                              name (append results nil) n
-                                              callback log-buffer)
-                                           ;; Normal mode: merge into a single list pkl
-                                           (let* ((items        (append results nil))
-                                                  (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
-                                                  (merge-script (make-temp-file "arrow-mmap-" nil ".py"))
-                                                  (paths-repr   (mapconcat (lambda (p) (format "%S" p))
-                                                                            items ", "))
-                                                  (mb (generate-new-buffer " *arrow-mmap*")))
-                                             (with-temp-file merge-script
-                                               (insert (arrow--merge-script-body paths-repr merge-out)))
-                                             (push merge-out arrow--pipeline-tempfiles)
-                                             (make-process
-                                              :name    "arrow-mmap-merge"
-                                              :buffer  mb
-                                              :command (list "python3" merge-script)
-                                              :sentinel (lambda (mp mev)
-                                                          (arrow--merge-sentinel
-                                                           mp mev merge-script mb merge-out callback
-                                                           log-buffer
-                                                           (format "%s* -- collected %d results" name n)))))))))))                                ;; In collect mode, intercept the sub-pipeline result
-                                ;; and replace it with a dict of all intermediate outputs.
-                                (elem-callback
-                                 (if (and collect-p elem-ctx)
-                                     (lambda (result err)
-                                       (if err
-                                           (funcall finish-callback nil err)
-                                         (let ((output-tbl (aref elem-ctx 1)))
-                                           (if (= (hash-table-count output-tbl) 0)
-                                               ;; No outputs recorded — pass through
-                                               (funcall finish-callback result nil)
-                                             ;; Build a dict pkl from the output table
-                                             (let* ((pairs nil))
-                                               (maphash (lambda (k v) (push (cons k v) pairs))
-                                                        output-tbl)
-                                               (setq pairs (nreverse pairs))
-                                               (arrow--run-dict-merge
-                                                pairs finish-callback log-buffer))))))
-                                   ;; Normal mode: pass through directly
-                                   finish-callback)))
-                           ;; Defer each element launch via run-at-time so
-                           ;; Emacs can process events between elements.
-                           ;; Without this, a fully-cached map executes all
-                           ;; element sub-pipelines synchronously inside
-                           ;; this sentinel, causing a multi-second UI freeze.
-                           (run-at-time 0 nil
-                             (lambda ()
-                               (if sub-ast
-                                   (arrow--exec-flow
-                                    sub-ast elem-path source-buffer log-buffer
-                                    elem-callback
-                                    elem-ctx)
-                                 (arrow--exec-block
-                                  name elem-path source-buffer log-buffer
-                                  elem-callback))))))))))))))))))
+                          ;; --- SCHEDULING ENGINE ---
+                          (queue          (number-sequence 0 (1- n)))
+                          (active-workers 0)
+                          (spawn-next     nil))
+                     
+                     (setq spawn-next
+                           (lambda ()
+                             (while (and queue (< active-workers arrow--map-max-workers))
+                               (let* ((idx       (pop queue))
+                                      (elem-path (nth idx elem-paths))
+                                      (elem-ctx  (when mod-sec (arrow--make-map-ctx mod-sec))))
+                                 
+                                 (cl-incf active-workers)
+                                 
+                                 (let ((elem-callback
+                                        (lambda (result err)
+                                          (aset results idx result)
+                                          (aset errors  idx err)
+                                          (setcar done-c (1+ (car done-c)))
+                                          
+                                          (when (functionp arrow--viz-map-hook)
+                                            (funcall arrow--viz-map-hook name (car done-c) n))
+                                          
+                                          ;; Fast-fail: clear pending queue on error
+                                          (if err (setq queue nil))
+                                          
+                                          ;; Free the slot before any further action
+                                          (cl-decf active-workers)
+                                          
+                                          (if (= (car done-c) n)
+                                              ;; We are the final worker to finish -> Merge!
+                                              (let ((first-err (cl-find-if #'identity (append errors nil))))
+                                                (if first-err
+                                                    (funcall callback nil first-err)
+                                                  (let* ((items        (append results nil))
+                                                         (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
+                                                         (merge-script (make-temp-file "arrow-mmap-" nil ".py"))
+                                                         (paths-repr   (mapconcat (lambda (p) (format "%S" p)) items ", "))
+                                                         (mb (generate-new-buffer " *arrow-mmap*")))
+                                                    (with-temp-file merge-script
+                                                      (insert (arrow--merge-script-body paths-repr merge-out)))
+                                                    (push merge-out arrow--pipeline-tempfiles)
+                                                    (make-process
+                                                     :name    "arrow-mmap-merge"
+                                                     :buffer  mb
+                                                     :command (list "python3" merge-script)
+                                                     :sentinel (lambda (mp mev)
+                                                                 (arrow--merge-sentinel
+                                                                  mp mev merge-script mb merge-out callback
+                                                                  log-buffer
+                                                                  (format "%s* -- collected %d results" name n)))))))
+                                            ;; Not final yet: spawn next job from queue
+                                            (funcall spawn-next)))))
+                                   
+                                   ;; Defer launch so Emacs stays responsive
+                                   (run-at-time 0 nil
+                                     (lambda ()
+                                       (if sub-ast
+                                           (arrow--exec-flow sub-ast elem-path source-buffer log-buffer elem-callback elem-ctx)
+                                         (arrow--exec-block name elem-path source-buffer log-buffer elem-callback)))))))))
+                     
+                     ;; Kick off the first batch of workers
+                     (funcall spawn-next))))))))))))
 
 
 ;;; ─── Recursive flow executor ─────────────────────────────────────────────────
@@ -1580,14 +1509,12 @@ Fails fast: if any element errors, CALLBACK receives (nil err)."
 (defun arrow--make-map-ctx (sec-edges)
   "Create a per-element execution context for mapped sub-pipelines.
 SEC-EDGES is a list of (source target) pairs for module-internal
-secondary arrows, or nil if there are none.  Returns a vector:
+secondary arrows.  Returns a vector:
   [0] secondary-targets — hash table: target -> list of sources
   [1] output-table      — hash table: node-name -> pkl-path
   [2] spine-pred        — name of last completed spine node (string or nil)
   [3] spine-from-fork   — non-nil when spine input came from a fork"
-  (vector (if sec-edges
-              (arrow--build-secondary-targets sec-edges)
-            (make-hash-table :test #'equal))
+  (vector (arrow--build-secondary-targets sec-edges)
           (make-hash-table :test #'equal)
           nil
           nil))
@@ -1611,7 +1538,7 @@ Calls (callback result nil) or (callback nil err) when done."
                           (plist-get rest :cache) (plist-get rest :force))))
     (`(node-map ,name . ,rest)
      (let ((map-flags (cl-loop for (k v) on rest by #'cddr
-                               when (memq k '(:cache :force :collect))
+                               when (memq k '(:cache :force))
                                append (list k v))))
        (arrow--exec-map-fork name input source-buffer log-buffer callback
                              map-flags)))
@@ -1992,7 +1919,7 @@ Returns a new list of propertized strings."
                 (state  (and arrow--viz-state (gethash name arrow--viz-state)))
                 (face   (if (memq state '(:done :cached)) 'arrow-viz-done 'arrow-viz-running)))
            (dotimes (i nlines)
-             (when (string-match (format "\\[ %s\\*\\*?[#!]? \\]"
+             (when (string-match (format "\\[ %s\\*[#!]? \\]"
                                          (regexp-quote name))
                                  (aref vec i))
                (aset vec i
@@ -2083,7 +2010,7 @@ whether the map node should show :cached or :done.")
                                  (plist-get rest :cache) (plist-get rest :force)))
     (`(node-map ,name . ,rest)
      (let ((map-flags (cl-loop for (k v) on rest by #'cddr
-                               when (memq k '(:cache :force :collect))
+                               when (memq k '(:cache :force))
                                append (list k v))))
        (arrow--viz-wrap-map-fork name input source-buffer log-buffer callback
                                  map-flags)))
@@ -2429,7 +2356,6 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
          (src (or src
                   (if info (nth 1 info)
                     (error "Not in a babel block"))))
-         ;; Detect flow name from #+name: if not provided
          (flow-name (or flow-name
                         (and info
                              (save-excursion
@@ -2437,113 +2363,75 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
                                (forward-line -1)
                                (when (looking-at "[ \t]*#\\+name:[ \t]*\\(.+?\\)[ \t]*$")
                                  (match-string-no-properties 1))))))
-         ;; Check for :arrow noblocks
          (params (and info (nth 2 info)))
-         (arrow-param (and params (cdr (assq :arrow params)))))
+         (arrow-param (and params (cdr (assq :arrow params))))
+         ;; --- NEW CODE HERE ---
+         (workers-param (and params (cdr (assq :workers params))))
+         (arrow--map-max-workers (if workers-param
+                                     (string-to-number workers-param)
+                                   arrow--map-max-workers)))
     (when (and arrow-param
-              (string-match-p "noblocks" (string-trim arrow-param)))
+               (string-match-p "noblocks" (string-trim arrow-param)))
       (error "Arrow: this block has :arrow noblocks — visual only, not executable"))
-    (let ((log-buf (get-buffer-create "*arrow-exec*")))
-    (with-current-buffer log-buf
-      (read-only-mode -1)
-      (erase-buffer)
-      (insert (format "Arrow pipeline started %s\n\n"
-                      (format-time-string "%Y-%m-%d %H:%M:%S")))
-      (read-only-mode 1))
-    ;; Show *arrow*, not the exec log
-    (arrow--display (arrow--render-src src))
-    (arrow--viz-init src log-buf flow-name)
-    (let* ((clean    (arrow--strip-comments src))
-           (tokens   (arrow--tokenise clean))
-           (parsed   (arrow--parse-program tokens))
-           (defs     (car parsed))
-           (flows    (cadr parsed))
-           (expanded (mapcar (lambda (f) (arrow--expand f defs)) flows))
-           (known    (mapcar #'car defs))
-           (spine    nil)
-           (sec-edges '()))
+    ;; Set up the execution log buffer
+    (let* ((log-buffer (get-buffer-create "*arrow-exec*"))
+           (parsed     (arrow--parse-program (arrow--tokenise (arrow--strip-comments src))))
+           (defs       (car  parsed))
+           (all-flows  (cadr parsed))
+           (expanded   (mapcar (lambda (f) (arrow--expand f defs)) all-flows))
+           (known-names (mapcar #'car defs))
+           (spine-flow  nil)
+           (sec-edges   '()))
+      (with-current-buffer log-buffer
+        (read-only-mode -1)
+        (erase-buffer)
+        (read-only-mode 1))
+      ;; Classify flows into spine and secondary
       (dolist (flow expanded)
-        (if (arrow--secondary-p flow known)
-            (setq sec-edges
-                  (append sec-edges
-                          (arrow--extract-secondary-edges flow)))
+        (if (arrow--secondary-p flow known-names)
+            (setq sec-edges (append sec-edges (arrow--extract-secondary-edges flow)))
           (dolist (n (arrow--collect-names flow))
-            (unless (member n known) (push n known)))
-          (setq spine flow)))
-      (if (null spine)
-          (message "Arrow: nothing to execute")
-        ;; Classify secondary edges into top-level and module-internal
-        (let* ((classified (arrow--classify-secondary-edges sec-edges))
-               (top-edges  (car classified))
-               (mod-edges  (cdr classified)))
-          ;; Validate top-level edges: source must precede target in spine order
-          (let ((exec-names (arrow--collect-exec-names src)))
-            (dolist (edge top-edges)
-              (let* ((src (car edge))
-                     (tgt (cadr edge))
-                     (src-pos (cl-position src exec-names :test #'equal))
-                     (tgt-pos (cl-position tgt exec-names :test #'equal)))
-                (when (and src-pos tgt-pos (>= src-pos tgt-pos))
-                  (error "Arrow: backward secondary arrow %s > %s — \
-source must appear before target in the pipeline" src tgt)))))
-          ;; Validate module-internal edges: source must precede target
-          ;; within the module's expanded definition
-          (maphash
-           (lambda (mod-name mod-sec-edges)
-             (let ((mod-def (assoc mod-name defs)))
-               (unless mod-def
-                 (error "Arrow: module %s referenced in dotted arrow but not defined"
-                        mod-name))
-               (let* ((mod-expanded (arrow--expand (cdr mod-def) defs))
-                      (mod-names (arrow--collect-node-names mod-expanded)))
-                 (dolist (edge mod-sec-edges)
-                   (let* ((src (car edge))
-                          (tgt (cadr edge))
-                          (src-pos (cl-position src mod-names :test #'equal))
-                          (tgt-pos (cl-position tgt mod-names :test #'equal)))
-                     (unless src-pos
-                       (error "Arrow: node %s.%s not found in module %s"
-                              mod-name src mod-name))
-                     (unless tgt-pos
-                       (error "Arrow: node %s.%s not found in module %s"
-                              mod-name tgt mod-name))
-                     (when (>= src-pos tgt-pos)
-                       (error "Arrow: backward intra-module arrow %s.%s > %s.%s"
-                              mod-name src mod-name tgt)))))))
-           mod-edges)
-          ;; Promote module-internal edges to top-level for modules
-          ;; that were inlined (referenced without *) in the spine
-          (let* ((promoted  (arrow--promote-inlined-module-edges
-                             mod-edges spine))
-                 (top-edges (append top-edges (car promoted)))
-                 (mod-edges (cdr promoted)))
-        (setq arrow--pipeline-tempfiles '()
-              arrow--pkl-hashes (make-hash-table :test #'equal)
-              arrow--pipeline-defs defs
-              arrow--shared-module-path (arrow--build-shared-module source-buffer)
-              arrow--secondary-edges top-edges
-              arrow--secondary-targets (arrow--build-secondary-targets top-edges)
-              arrow--module-secondary-edges mod-edges
+            (unless (member n known-names) (push n known-names)))
+          (setq spine-flow
+                (if spine-flow
+                    (if (eq (car spine-flow) 'tracks)
+                        `(tracks ,@(cdr spine-flow) ,flow)
+                      `(tracks ,spine-flow ,flow))
+                  flow))))
+      (unless spine-flow
+        (error "Arrow: nothing to execute"))
+      ;; Initialise visualisation and pipeline state
+      (arrow--viz-init src log-buffer flow-name)
+      (setq arrow--pipeline-tempfiles nil
+            arrow--pipeline-defs      defs)
+      ;; Build secondary-edge lookup tables
+      (let* ((classified  (arrow--classify-secondary-edges sec-edges))
+             (top-edges   (car classified))
+             (mod-edges   (cdr classified))
+             (promoted    (arrow--promote-inlined-module-edges mod-edges spine-flow))
+             (top-edges   (append top-edges (car promoted))))
+        (setq arrow--secondary-edges         top-edges
+              arrow--secondary-targets       (arrow--build-secondary-targets top-edges)
+              arrow--module-secondary-edges  (cdr promoted)
               arrow--current-spine-predecessor nil
-              arrow--spine-from-fork nil)
-        (arrow--cache-init source-buffer)
-        (arrow--exec-flow-viz
-         spine nil source-buffer log-buf
-         (lambda (result err)
-           (dolist (f arrow--pipeline-tempfiles)
-             (ignore-errors (delete-file f)))
-           (setq arrow--pipeline-tempfiles '())
-           (arrow--viz-stop-timer)
-           (arrow--viz-redraw)
-           (with-current-buffer log-buf
-             (read-only-mode -1)
-             (goto-char (point-max))
-             (insert (if err
-                         (format "\nPipeline FAILED: %s\n" err)
-                       "\nPipeline completed.\n"))
-             (read-only-mode 1))
-           (unless err (arrow--repl-reload))
-           (message (if err "Arrow pipeline FAILED" "Arrow pipeline complete")))))))))))
+              arrow--spine-from-fork          nil))
+      ;; Assemble shared-code module (must happen after viz-init sets inspect dir)
+      (setq arrow--shared-module-path
+            (arrow--build-shared-module source-buffer))
+      ;; Launch the pipeline
+      (arrow--exec-flow-viz
+       spine-flow nil source-buffer log-buffer
+       (lambda (result err)
+         (arrow--viz-stop-timer)
+         (if err
+             (arrow--exec-log log-buffer (format "Pipeline error: %s" err) "[error]")
+           (arrow--exec-log log-buffer "Pipeline complete." "[done]"))
+         (arrow--repl-reload)
+         (run-at-time 5 nil
+           (lambda ()
+             (dolist (f arrow--pipeline-tempfiles)
+               (ignore-errors (delete-file f)))
+             (setq arrow--pipeline-tempfiles nil))))))))
 
 (defun arrow--find-named-arrow-blocks (buffer)
   "Return alist of (name . body) for all named arrow src blocks in BUFFER.
@@ -2641,53 +2529,17 @@ injects shared module symbols."
       ;; reload
       (insert "def _reload():\n")
       (insert "    \"\"\"Reload all node outputs from disk into `nodes` dict.\"\"\"\n")
-      (insert "    import re as _re\n")
       (insert "    _load_shared()\n")
       (insert "    d = {}\n")
       (insert "    if _inspect_dir and _os.path.isdir(_inspect_dir):\n")
-      (insert "        # First pass: find collect-mode map nodes (Name.N.pkl files)\n")
-      (insert "        _elem_pat = _re.compile(r'^(.+)\\.([0-9]+)\\.pkl$')\n")
-      (insert "        _collect_names = set()\n")
-      (insert "        for _f in _os.listdir(_inspect_dir):\n")
-      (insert "            _m = _elem_pat.match(_f)\n")
-      (insert "            if _m:\n")
-      (insert "                _collect_names.add(_m.group(1))\n")
-      (insert "        # Load collect-mode nodes as lists of dicts\n")
-      (insert "        for _cn in sorted(_collect_names):\n")
-      (insert "            _elems = []\n")
-      (insert "            _i = 0\n")
-      (insert "            while True:\n")
-      (insert "                _ep = _os.path.join(_inspect_dir, f'{_cn}.{_i}.pkl')\n")
-      (insert "                if not _os.path.exists(_ep):\n")
-      (insert "                    break\n")
-      (insert "                try:\n")
-      (insert "                    with open(_ep, 'rb') as _fh:\n")
-      (insert "                        _elems.append(_pickle.load(_fh))\n")
-      (insert "                except Exception as _e:\n")
-      (insert "                    print(f'  [warn] {_cn}[{_i}]: {_e}')\n")
-      (insert "                    _elems.append(None)\n")
-      (insert "                _i += 1\n")
-      (insert "            if _elems:\n")
-      (insert "                d[_cn] = _elems\n")
-      (insert "        # Second pass: load regular node pkls\n")
       (insert "        for _f in sorted(_glob.glob(_os.path.join(_inspect_dir, '*.pkl'))):\n")
       (insert "            _base = _os.path.basename(_f)\n")
       (insert "            if _base.endswith('.input.pkl'):\n")
       (insert "                continue\n")
-      (insert "            # Skip element sub-files (already loaded above)\n")
-      (insert "            if _elem_pat.match(_base):\n")
-      (insert "                continue\n")
       (insert "            _name = _os.path.splitext(_base)[0]\n")
-      (insert "            # Skip if already loaded as collect-mode\n")
-      (insert "            if _name in _collect_names:\n")
-      (insert "                continue\n")
       (insert "            try:\n")
       (insert "                with open(_f, 'rb') as _fh:\n")
-      (insert "                    _val = _pickle.load(_fh)\n")
-      (insert "                # Skip collect marker dicts\n")
-      (insert "                if isinstance(_val, dict) and _val.get('__arrow_collect__'):\n")
-      (insert "                    continue\n")
-      (insert "                d[_name] = _val\n")
+      (insert "                    d[_name] = _pickle.load(_fh)\n")
       (insert "            except Exception as _e:\n")
       (insert "                print(f'  [warn] {_name}: {_e}')\n")
       (insert "    globals()['nodes'] = d\n")
@@ -2868,8 +2720,56 @@ symbols are injected into the namespace.  Call `_reload()` to refresh."
 
 (arrow--setup-arrow-buffer-keys (get-buffer-create "*arrow*"))
 
+;;; ── Pipeline kill ────────────────────────────────────────────────────────────
 
+(defun arrow-kill ()
+  "Kill the currently running Arrow pipeline and all its subprocesses.
+Kills every live process whose name starts with \"arrow-\" (node runners,
+split/merge helpers, etc.), cleans up temp files, resets pipeline state,
+and marks any in-flight nodes as :error in the visualisation."
+  (interactive)
+  ;; 1. Kill all live arrow subprocesses
+  (let ((killed 0))
+    (dolist (proc (process-list))
+      (when (and (string-prefix-p "arrow-" (process-name proc))
+                 ;; Spare the REPL — it's a persistent interactive process
+                 (not (string-prefix-p "arrow-repl" (process-name proc)))
+                 (process-live-p proc))
+        ;; Suppress the sentinel so it doesn't fire callbacks on a killed proc
+        (set-process-sentinel proc #'ignore)
+        (delete-process proc)
+        (cl-incf killed)))
+    ;; 2. Mark every :running node as :error in the visualisation
+    (when arrow--viz-state
+      (maphash (lambda (name state)
+                 (when (eq state :running)
+                   (puthash name :error arrow--viz-state)))
+               arrow--viz-state))
+    ;; 3. Stop the animation timer and do a final redraw
+    (arrow--viz-stop-timer)
+    (arrow--viz-redraw)
+    ;; 4. Clean up temp files
+    (dolist (f arrow--pipeline-tempfiles)
+      (ignore-errors (delete-file f)))
+    (setq arrow--pipeline-tempfiles nil)
+    ;; 5. Reset in-flight scheduling state
+    (setq arrow--viz-map-hook nil
+          arrow--map-saw-miss nil)
+    ;; 6. Log and report
+    (when (buffer-live-p arrow--viz-log-buffer)
+      (arrow--exec-log arrow--viz-log-buffer
+                       (format "Pipeline killed (%d subprocess%s terminated)."
+                               killed (if (= killed 1) "" "es"))
+                       "[killed]"))
+    (message "Arrow: pipeline killed (%d subprocess%s terminated)."
+             killed (if (= killed 1) "" "es"))))
 
+(with-eval-after-load 'arrow-lang
+  (with-current-buffer (get-buffer-create "*arrow*")
+    (local-set-key (kbd "C-c C-k") #'arrow-kill))
+  (with-eval-after-load 'evil
+    (evil-define-key 'normal arrow-mode-map
+      (kbd "C-c C-k") #'arrow-kill)))
 
 
 (provide 'arrow-lang)
