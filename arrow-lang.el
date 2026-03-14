@@ -1807,413 +1807,128 @@ Calls CALLBACK with (merge-out nil) or (nil err)."
                             &optional ctx)
   "Run all BRANCHES in parallel; wait for all.
 Merges results into a dict keyed by each branch's terminal node name.
-For Python branches writes a dict pickle; others get JSON object.
 CTX, when non-nil, is a map-element context for secondary arrow support."
-  (let* ((n        (length branches))
-         (results  (make-vector n nil))
-         (errors   (make-vector n nil))
-         (done-c   (list 0))
+  (let* ((n            (length branches))
+         (results      (make-vector n nil))
+         (errors       (make-vector n nil))
+         (done-c       (list 0))
          (branch-names (cl-loop for b in branches for i from 0
                                 collect (or (arrow--terminal-node-name b)
                                             (format "branch_%d" i)))))
     (dotimes (i n)
-      (let ((idx i))
-        (arrow--exec-flow
-         (nth i branches) input source-buffer log-buffer
-         (lambda (result err)
-           (aset results idx result)
-           (aset errors  idx err)
-           (setcar done-c (1+ (car done-c)))
-           (when (= (car done-c) n)
-           (let ((first-err (cl-find-if #'identity (append errors nil))))
-             (if first-err
-                 (funcall callback nil first-err)
-               (let* ((items (append results nil))
-                      (all-pkl (cl-every (lambda (r)
-                                           (and (stringp r)
-                                                (string-suffix-p ".pkl" r)
-                                                (file-exists-p r)))
-                                         items)))
-                 (if all-pkl
-                     (let ((names-and-paths (cl-mapcar #'cons branch-names items)))
-                       (arrow--run-dict-merge
-                        names-and-paths callback log-buffer))
-                   ;; non-pickle: JSON object of strings
-                   (let ((json-pairs (cl-mapcar
-                                      (lambda (name val)
-                                        (format "%S: %S" name val))
-                                      branch-names items)))
-                     (funcall callback
-                              (concat "{" (mapconcat #'identity json-pairs ", ") "}")
-                              nil))))))))
-         ctx)))))
-
-(defun arrow--exec-or-fork (branches input source-buffer log-buffer callback)
-  "Run all BRANCHES in parallel; first to succeed wins."
-  (let ((fired (list nil)))
-    (dotimes (i (length branches))
-      (arrow--exec-flow
-       (nth i branches) input source-buffer log-buffer
-       (lambda (result err)
-         (unless (car fired)
-           (when (null err)
-             (setcar fired t)
-             (funcall callback result nil))))))))
-;;; ─── Live visualization ──────────────────────────────────────────────────────
-;;
-;; State is tracked in two hash tables reset at each pipeline run:
-;;   arrow--viz-state        : node-name -> :pending | :running | :done | :error
-;;   arrow--viz-map-progress : node-name -> (done . total)
-;;
-;; A repeating timer calls arrow--viz-redraw every 250ms while any node is
-;; :running.  The viz buffer is *arrow* (already shown by C-c C-c).
-;; The exec log buffer *arrow-exec* is hidden by default; C-c C-l in *arrow*
-;; opens it.
-
-(defvar arrow--viz-state        nil "Hash table: node name -> execution state.")
-(defvar arrow--viz-map-progress nil "Hash table: node name -> (done . total).")
-(defvar arrow--viz-timer        nil "Repeating redraw timer, or nil.")
-(defvar arrow--viz-src          nil "Arrow src string for the running pipeline.")
-(defvar arrow--viz-frame        0   "Animation frame counter.")
-(defvar arrow--viz-log-buffer   nil "The *arrow-exec* buffer for the current run.")
-(defvar arrow--viz-cache-hit    nil "Dynamically bound to t inside a cache-hit callback.")
-
-(defvar arrow--viz-inspect-dir  nil "Directory holding persistent per-node inspect pickles.")
-(defvar arrow--viz-output       nil "Hash table: node name -> stable inspect pkl path.")
-
-(defvar arrow--viz-flow-name    nil
-  "Name of the currently-running pipeline (from #+name: of the arrow block).
-Used to scope the inspect directory and REPL buffer per flow.")
-
-(defvar arrow--viz-map-hook     nil
-  "If non-nil, a function (name done total) called on each map-element completion.
-Set by arrow--viz-wrap-map-fork; cleared on pipeline end.")
-
-;;; ── Faces ────────────────────────────────────────────────────────────────────
-
-(defface arrow-viz-pending '((t :inherit shadow))
-  "Face for pending (not-yet-run) nodes.")
-(defface arrow-viz-running '((t :foreground "yellow" :weight bold))
-  "Face for currently-executing nodes.")
-(defface arrow-viz-done    '((t :foreground "green"  :weight bold))
-  "Face for successfully completed nodes.")
-(defface arrow-viz-cached  '((t :foreground "cyan"   :weight bold))
-  "Face for nodes whose result was loaded from cache.")
-(defface arrow-viz-error   '((t :foreground "red"    :weight bold))
-  "Face for failed nodes.")
-
-;;; ── State management ─────────────────────────────────────────────────────────
-
-(defun arrow--viz-init (src log-buffer &optional flow-name)
-  "Reset visualization state for a new pipeline run of SRC.
-FLOW-NAME, if non-nil, scopes the inspect directory so each
-named flow gets its own REPL and node outputs."
-  (setq arrow--viz-state        (make-hash-table :test #'equal)
-        arrow--viz-output       (make-hash-table :test #'equal)
-        arrow--viz-map-progress (make-hash-table :test #'equal)
-        arrow--viz-src          src
-        arrow--viz-frame        0
-        arrow--viz-log-buffer   log-buffer
-        arrow--viz-map-hook     nil
-        arrow--shared-module-path nil
-        arrow--viz-flow-name    flow-name)
-
-  ;; Scope the inspect directory per flow-name so each pipeline
-  ;; gets its own REPL namespace and node outputs.
-  (let ((dir-name (if flow-name
-                      (format "arrow-inspect-%s" flow-name)
-                    "arrow-inspect")))
-    (setq arrow--viz-inspect-dir
-          (expand-file-name dir-name temporary-file-directory)))
-  (when (file-exists-p arrow--viz-inspect-dir)
-    (dolist (f (directory-files arrow--viz-inspect-dir t
-                               "\\.\\(pkl\\|body\\.py\\)\\'"))
-      (ignore-errors (delete-file f))))
-  (unless (file-exists-p arrow--viz-inspect-dir)
-    (make-directory arrow--viz-inspect-dir t))
-  ;; Seed all nodes as :pending
-  (dolist (name (arrow--collect-exec-names src))
-    (puthash name :pending arrow--viz-state))
-  (arrow--viz-redraw))
-
-(defun arrow--viz-set (name state)
-  "Update NAME to STATE and trigger a redraw."
-  (when arrow--viz-state
-    (puthash name state arrow--viz-state)
-    (arrow--viz-redraw)))
-
-(defun arrow--viz-running-p ()
-  "Return t if any node is currently :running."
-  (when arrow--viz-state
-    (let (found)
-      (maphash (lambda (_k v) (when (eq v :running) (setq found t)))
-               arrow--viz-state)
-      found)))
-
-(defun arrow--viz-start-timer ()
-  "Start the animation timer if not already running."
-  (unless (and arrow--viz-timer (timerp arrow--viz-timer))
-    (setq arrow--viz-timer
-          (run-with-timer 0.25 0.25 #'arrow--viz-tick))))
-
-(defun arrow--viz-stop-timer ()
-  "Stop the animation timer."
-  (when (timerp arrow--viz-timer)
-    (cancel-timer arrow--viz-timer))
-  (setq arrow--viz-timer nil))
-
-(defun arrow--viz-tick ()
-  "Timer callback: advance frame and redraw if anything is still running."
-  (if (arrow--viz-running-p)
-      (progn
-        (setq arrow--viz-frame (% (1+ arrow--viz-frame) 8))
-        (arrow--viz-redraw))
-    (arrow--viz-stop-timer)
-    (arrow--viz-redraw)))  ; one final redraw to show terminal state
-
-;;; ── Rendering ────────────────────────────────────────────────────────────────
-
-(defun arrow--viz-redraw ()
-  "Re-render the arrow graph into *arrow* with state-based colorization."
-  (when (and arrow--viz-src (buffer-live-p (get-buffer "*arrow*")))
-    (let* ((plain-lines (split-string (arrow--render-src arrow--viz-src) "\n"))
-           (colored     (arrow--viz-colorize plain-lines)))
-      (with-current-buffer (get-buffer "*arrow*")
-        (let ((inhibit-read-only t))
-          (erase-buffer)
-          (insert (mapconcat #'identity colored "\n")))))))
-
-(defun arrow--viz-colorize (lines)
-  "Apply faces to LINES based on current node states.
-Returns a new list of propertized strings."
-  (let* ((vec    (vconcat lines))
-         (nlines (length vec))
-         (faces  (make-vector nlines nil)))
-    ;; Pass 1: colorize node boxes, record their faces
-    (dotimes (i nlines)
-      (let ((line (aref vec i)))
-        ;; Detect [ NodeName ] or [ NodeName* ]
-        (if (string-match "\\[\\*?\\([^]]+?\\)\\*?\\]" line)
-            (let* ((raw-name (string-trim (match-string 1 line)))
-                   ;; strip trailing *, #, ! suffixes (map, cache, force nodes)
-                   (name     (string-trim
-                              (replace-regexp-in-string "[*#!]+\\'" "" raw-name)))
-                   (state    (and arrow--viz-state
-                                  (gethash name arrow--viz-state)))
-                   (face     (pcase state
-                               (:pending 'arrow-viz-pending)
-                               (:running 'arrow-viz-running)
-                               (:done    'arrow-viz-done)
-                               (:cached  'arrow-viz-cached)
-                               (:error   'arrow-viz-error)
-                               (_        'default))))
-              (aset vec i (propertize line 'face face))
-              (aset faces i face))
-          ;; Non-node line: leave face nil for now
-          (aset faces i nil))))
-    ;; Pass 2: propagate faces to connector lines.
-    ;; For each node line, walk upward through preceding non-node lines
-    ;; (connectors like │ ▼ ├──▶ └──▶) and color them with that node's face.
-    ;; This makes the connectors "leading into" a node share its color.
-    (dotimes (i nlines)
-      (when (aref faces i)
-        (let ((j (1- i)))
-          (while (and (>= j 0) (null (aref faces j)))
-            (aset vec j (propertize (aref vec j) 'face (aref faces i)))
-            (aset faces j (aref faces i))
-            (setq j (1- j))))))
-    ;; Pass 3: any remaining uncolored lines get default face
-    (dotimes (i nlines)
-      (unless (aref faces i)
-        (aset vec i (propertize (aref vec i) 'face 'default))))
-    ;; Append map-progress annotations
-    (when arrow--viz-map-progress
-      (maphash
-       (lambda (name progress)
-         (let* ((done   (car progress))
-                (total  (cdr progress))
-                (state  (and arrow--viz-state (gethash name arrow--viz-state)))
-                (face   (if (memq state '(:done :cached)) 'arrow-viz-done 'arrow-viz-running)))
-           (dotimes (i nlines)
-             (when (string-match (format "\\[ %s\\*[#!]? \\]"
-                                         (regexp-quote name))
-                                 (aref vec i))
-               (aset vec i
-                     (concat (aref vec i)
-                             (propertize (format "  %d/%d" done total)
-                                         'face face)))))))
-       arrow--viz-map-progress))
-    (append vec nil)))
-;;; ── Hooks into execution ─────────────────────────────────────────────────────
-
-(defun arrow--viz-store-context (name input source-buffer)
-  "Save node's input pickle and block body to the inspect directory.
-These are used by the REPL's _run() command for interactive re-execution."
-  (when arrow--viz-inspect-dir
-    ;; Save input pickle
-    (when (and input (stringp input)
-               (string-suffix-p ".pkl" input)
-               (file-exists-p input))
-      (let ((dest (expand-file-name (format "%s.input.pkl" name)
-                                    arrow--viz-inspect-dir)))
-        (ignore-errors (copy-file input dest t))))
-    ;; Save block body
-    (let ((block-info (arrow--exec-find-block name source-buffer)))
-      (when block-info
-        (let ((body (nth 1 block-info))
-              (dest (expand-file-name (format "%s.body.py" name)
-                                      arrow--viz-inspect-dir)))
-          (with-temp-file dest
-            (insert body)))))))
-
-(defun arrow--viz-wrap-exec-block (name input source-buffer log-buffer callback
-                                   &optional cache-p force-p)
-  "Wrapper around arrow--exec-block that updates visualization state."
-  (arrow--viz-set name :running)
-  (arrow--viz-start-timer)
-  ;; Save context NOW (synchronously) before the async subprocess runs
-  (arrow--viz-store-context name input source-buffer)
-  (arrow--exec-block
-   name input source-buffer log-buffer
-   (lambda (result err)
-     (arrow--viz-set name (cond (err                  :error)
-                                (arrow--viz-cache-hit :cached)
-                                (t                    :done)))
-     (when (and result (not err))
-       (arrow--viz-store-output name result))
-     (funcall callback result err))
-   cache-p force-p))
-
-(defvar arrow--map-saw-miss nil
-  "When non-nil, a cons cell (flag).  Set to t by exec-block when running
-a subprocess (not cache hit).  Used by viz-wrap-map-fork to determine
-whether the map node should show :cached or :done.")
-
-(defun arrow--viz-wrap-map-fork (name input source-buffer log-buffer callback
-                                &optional flags)
-  "Wrapper around arrow--exec-map-fork that shows per-element progress."
-  (arrow--viz-set name :running)
-  (arrow--viz-start-timer)
-  (puthash name (cons 0 0) arrow--viz-map-progress)
-  (setq arrow--viz-map-hook
-        (lambda (hook-name done total)
-          (when (equal hook-name name)
-            (puthash name (cons done total) arrow--viz-map-progress)
-            (arrow--viz-redraw))))
-  ;; Track whether any inner subprocess ran (i.e. cache miss).
-  ;; The exec-sentinel sets (setcar arrow--map-saw-miss t) when
-  ;; a real subprocess completes.
-  (setq arrow--map-saw-miss (list nil))
-  (arrow--exec-map-fork
-   name input source-buffer log-buffer
-   (lambda (result err)
-     (arrow--viz-set name (cond (err                           :error)
-                                ((car arrow--map-saw-miss)     :done)
-                                (t                             :cached)))
-     (setq arrow--viz-map-hook nil
-           arrow--map-saw-miss nil)
-     (when (and result (not err)) (arrow--viz-store-output name result))
-     (funcall callback result err))
-   flags))
-
-;;; ── Patched exec-flow using viz wrappers ─────────────────────────────────────
-
-(defun arrow--exec-flow-viz (ast input source-buffer log-buffer callback)
-  "Like arrow--exec-flow but routes node execution through viz wrappers."
-  (pcase ast
-    (`(node ,name . ,rest)
-     (arrow--viz-wrap-exec-block name input source-buffer log-buffer callback
-                                 (plist-get rest :cache) (plist-get rest :force)))
-    (`(node-map ,name . ,rest)
-     (let ((map-flags (cl-loop for (k v) on rest by #'cddr
-                               when (memq k '(:cache :force))
-                               append (list k v))))
-       (arrow--viz-wrap-map-fork name input source-buffer log-buffer callback
-                                 map-flags)))
-    (`(seq . ,steps)
-     (arrow--exec-seq-viz steps input source-buffer log-buffer callback))
-    (`(fork . ,branches)
-     (arrow--exec-and-fork-viz branches input source-buffer log-buffer callback))
-    (`(fork-or . ,branches)
-     (arrow--exec-or-fork-viz branches input source-buffer log-buffer callback))
-    (`(tracks . ,_)
-     (arrow--exec-flow-viz (cadr ast) input source-buffer log-buffer callback))
-    (_ (funcall callback input nil))))
-
-(defun arrow--exec-seq-viz (steps input source-buffer log-buffer callback)
-  (if (null steps)
-      (funcall callback input nil)
-    (let* ((step (car steps))
-           (step-name (pcase step
-                        (`(node ,name . ,_) name)
-                        (`(node-map ,name . ,_) name)
-                        (_ nil)))
-           (step-is-fork (memq (car step) '(fork fork-or))))
-      (if (and step-name arrow--secondary-targets
-               (gethash step-name arrow--secondary-targets))
-          (arrow--maybe-merge-secondary-input
-           step-name input source-buffer log-buffer
-           (lambda (merged-input err)
-             (if err
-                 (funcall callback nil err)
-               (arrow--exec-flow-viz
-                step merged-input source-buffer log-buffer
-                (lambda (result err2)
-                  (if err2
-                      (funcall callback nil err2)
-                    (when step-name
-                      (setq arrow--current-spine-predecessor step-name))
-                    (setq arrow--spine-from-fork step-is-fork)
-                    (arrow--exec-seq-viz
-                     (cdr steps) result source-buffer log-buffer callback)))))))
-        (arrow--exec-flow-viz
-         step input source-buffer log-buffer
-         (lambda (result err)
-           (if err
-               (funcall callback nil err)
-             (when step-name
-               (setq arrow--current-spine-predecessor step-name))
-             (setq arrow--spine-from-fork step-is-fork)
-             (arrow--exec-seq-viz
-              (cdr steps) result source-buffer log-buffer callback))))))))
+      (let* ((idx        i)
+             (branch     (nth i branches))
+             (entry-name (pcase branch
+                           (`(node ,--n . ,_)                --n)
+                           (`(node-map ,--n . ,_)            --n)
+                           (`(seq (node ,--n . ,_) . ,_)     --n)
+                           (`(seq (node-map ,--n . ,_) . ,_) --n)
+                           (_ nil)))
+             (sec-tbl    (if ctx (aref ctx 0) arrow--secondary-targets))
+             (has-sec    (and entry-name (gethash entry-name sec-tbl))))
+        (cl-flet ((run-branch (inp)
+                    (arrow--exec-flow
+                     branch inp source-buffer log-buffer
+                     (lambda (result err)
+                       (aset results idx result)
+                       (aset errors  idx err)
+                       (setcar done-c (1+ (car done-c)))
+                       (when (= (car done-c) n)
+                         (let ((first-err (cl-find-if #'identity (append errors nil))))
+                           (if first-err
+                               (funcall callback nil first-err)
+                             (let* ((items    (append results nil))
+                                    (all-pkl  (cl-every
+                                               (lambda (r)
+                                                 (and (stringp r)
+                                                      (string-suffix-p ".pkl" r)
+                                                      (file-exists-p r)))
+                                               items)))
+                               (if all-pkl
+                                   (arrow--run-dict-merge
+                                    (cl-mapcar #'cons branch-names items)
+                                    callback log-buffer)
+                                 (funcall callback
+                                          (concat "{"
+                                                  (mapconcat
+                                                   (lambda (nm v) (format "%S: %S" nm v))
+                                                   branch-names items ", ")
+                                                  "}")
+                                          nil)))))))
+                     ctx)))
+          (if (not has-sec)
+              (run-branch input)
+            (arrow--maybe-merge-secondary-input
+             entry-name input source-buffer log-buffer
+             (lambda (merged err)
+               (if err
+                   (progn (aset errors idx err)
+                          (setcar done-c (1+ (car done-c)))
+                          (when (= (car done-c) n)
+                            (funcall callback nil err)))
+                 (run-branch merged)))
+             ctx)))))))
 
 (defun arrow--exec-and-fork-viz (branches input source-buffer log-buffer callback)
-  (let* ((n       (length branches))
-         (results (make-vector n nil))
-         (errors  (make-vector n nil))
-         (done-c  (list 0))
+  "Viz-wrapper version of `arrow--exec-and-fork'."
+  (let* ((n            (length branches))
+         (results      (make-vector n nil))
+         (errors       (make-vector n nil))
+         (done-c       (list 0))
          (branch-names (cl-loop for b in branches for i from 0
                                 collect (or (arrow--terminal-node-name b)
                                             (format "branch_%d" i)))))
     (dotimes (i n)
-      (let ((idx i))
-        (arrow--exec-flow-viz
-         (nth i branches) input source-buffer log-buffer
-         (lambda (result err)
-           (aset results idx result)
-           (aset errors  idx err)
-           (setcar done-c (1+ (car done-c)))
-           (when (= (car done-c) n)
-             (let ((first-err (cl-find-if #'identity (append errors nil))))
-               (if first-err
-                   (funcall callback nil first-err)
-                 (let* ((items   (append results nil))
-                        (all-pkl (cl-every (lambda (r)
-                                             (and (stringp r)
-                                                  (string-suffix-p ".pkl" r)
-                                                  (file-exists-p r)))
-                                           items)))
-                   (if all-pkl
-                       (let ((names-and-paths (cl-mapcar #'cons branch-names items)))
-                         (arrow--run-dict-merge
-                          names-and-paths callback log-buffer))
-                     (let ((json-pairs (cl-mapcar
-                                        (lambda (name val)
-                                          (format "%S: %S" name val))
-                                        branch-names items)))
-                       (funcall callback
-                                (concat "{" (mapconcat #'identity json-pairs ", ") "}")
-                                nil)))))))))))))
+      (let* ((idx        i)
+             (branch     (nth i branches))
+             (entry-name (pcase branch
+                           (`(node ,--n . ,_)                --n)
+                           (`(node-map ,--n . ,_)            --n)
+                           (`(seq (node ,--n . ,_) . ,_)     --n)
+                           (`(seq (node-map ,--n . ,_) . ,_) --n)
+                           (_ nil)))
+             (has-sec    (and entry-name
+                              (gethash entry-name arrow--secondary-targets))))
+        (cl-flet ((run-branch (inp)
+                    (arrow--exec-flow-viz
+                     branch inp source-buffer log-buffer
+                     (lambda (result err)
+                       (aset results idx result)
+                       (aset errors  idx err)
+                       (setcar done-c (1+ (car done-c)))
+                       (when (= (car done-c) n)
+                         (let ((first-err (cl-find-if #'identity (append errors nil))))
+                           (if first-err
+                               (funcall callback nil first-err)
+                             (let* ((items    (append results nil))
+                                    (all-pkl  (cl-every
+                                               (lambda (r)
+                                                 (and (stringp r)
+                                                      (string-suffix-p ".pkl" r)
+                                                      (file-exists-p r)))
+                                               items)))
+                               (if all-pkl
+                                   (arrow--run-dict-merge
+                                    (cl-mapcar #'cons branch-names items)
+                                    callback log-buffer)
+                                 (funcall callback
+                                          (concat "{"
+                                                  (mapconcat
+                                                   (lambda (nm v) (format "%S: %S" nm v))
+                                                   branch-names items ", ")
+                                                  "}")
+                                          nil))))))))))
+          (if (not has-sec)
+              (run-branch input)
+            (arrow--maybe-merge-secondary-input
+             entry-name input source-buffer log-buffer
+             (lambda (merged err)
+               (if err
+                   (progn (aset errors idx err)
+                          (setcar done-c (1+ (car done-c)))
+                          (when (= (car done-c) n)
+                            (funcall callback nil err)))
+                 (run-branch merged))))))))))
 
 (defun arrow--exec-or-fork-viz (branches input source-buffer log-buffer callback)
   (let ((fired (list nil)))
@@ -2930,3 +2645,4 @@ and marks any in-flight nodes as :error in the visualisation."
                           (process-exit-status proc)
                           (with-current-buffer buf
                             (buffer-string)))))))
+
