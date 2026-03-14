@@ -597,6 +597,63 @@ Matches [ NAME ], [ NAME* ], [NAME], and variants with # or ! suffixes."
 
 ;;; ─── Org Babel ───────────────────────────────────────────────────────────────
 
+(defun arrow--load-preamble (flow-name)
+  "Generate a Python preamble that loads all node outputs for FLOW-NAME
+into a `nodes` dict and injects :arrow shared symbols into the namespace.
+Errors immediately if FLOW-NAME has not been run this session."
+  (let ((entry (gethash flow-name arrow--pipeline-registry)))
+    (unless entry
+      (error "Arrow: pipeline %S has not been run this session" flow-name))
+    (let* ((output-tbl    (car entry))
+           (shared-path   (cdr entry))
+           (lines         (list "import dill as _arrow_pickle, os as _arrow_os\n"
+                                "_arrow_nodes = {}\n")))
+      ;; Load each node output
+      (maphash
+       (lambda (name pkl-path)
+         (when (and (stringp pkl-path)
+                    (string-suffix-p ".pkl" pkl-path))
+           (push (format
+                  "_arrow_p = %S\n\
+if _arrow_os.path.exists(_arrow_p):\n\
+    _arrow_nodes[%S] = _arrow_pickle.load(open(_arrow_p, 'rb'))\n"
+                  pkl-path name)
+                 lines)))
+       output-tbl)
+      ;; Inject shared module symbols
+      (when (and shared-path (stringp shared-path)
+                 (file-exists-p shared-path))
+        (push (format
+               "import importlib.util as _arrow_ilu\n\
+_arrow_spec = _arrow_ilu.spec_from_file_location('_arrow_shared', %S)\n\
+_arrow_mod  = _arrow_ilu.module_from_spec(_arrow_spec)\n\
+_arrow_spec.loader.exec_module(_arrow_mod)\n\
+for _arrow_k, _arrow_v in vars(_arrow_mod).items():\n\
+    if not _arrow_k.startswith('_'):\n\
+        globals()[_arrow_k] = _arrow_v\n\
+del _arrow_ilu, _arrow_spec, _arrow_mod\n"
+               shared-path)
+              lines))
+      ;; Expose nodes dict and clean up private names
+      (push "nodes = _arrow_nodes\n\
+del _arrow_pickle, _arrow_os, _arrow_nodes\n" lines)
+      (mapconcat #'identity (nreverse lines) ""))))
+
+(defun arrow--babel-execute-python-advice (orig-fun body params)
+  "Around-advice for `org-babel-execute:python'.
+If PARAMS contains :arrow load <flow-name>, prepend the node-loading
+preamble to BODY before delegating to the original function."
+  (let ((arrow-param (cdr (assq :arrow params))))
+    (if (and arrow-param
+             (string-match "\\`load\\s-+\\(\\S-+\\)" (string-trim arrow-param)))
+        (let* ((flow-name (match-string 1 (string-trim arrow-param)))
+               (preamble  (arrow--load-preamble flow-name)))
+          (funcall orig-fun (concat preamble body) params))
+      (funcall orig-fun body params))))
+
+(advice-add 'org-babel-execute:python :around
+            #'arrow--babel-execute-python-advice)
+
 (defun org-babel-execute:arrow (body params)
   ;; Capture point now, before arrow--display can change the selected window
   ;; or trigger hooks that move point in this buffer.
@@ -984,6 +1041,65 @@ avoiding all quoting/escaping issues with triple-quotes and backslashes."
      "_out = tempfile.mktemp(suffix='.pkl', prefix='arrow-data-')\n"
      "with open(_out, 'wb') as _f:\n"
      "    pickle.dump(output, _f)\n"
+     "import hashlib as _hl\n"
+     "with open(_out, 'rb') as _f:\n"
+     "    _hash = _hl.sha256(_f.read()).hexdigest()\n"
+     "print(_out)\n"
+     "print(_hash)\n")))
+
+(defun arrow--python-script-pipeline (body &optional shared-path inspect-dir)
+  "Return a Python harness for BODY that loads the pipeline `nodes` dict.
+Used for blocks tagged :arrow pipeline — disconnected from the execution
+graph but with full access to all node outputs, exactly as in the REPL.
+INSPECT-DIR defaults to `arrow--viz-inspect-dir'."
+  (let* ((dir       (or inspect-dir arrow--viz-inspect-dir ""))
+         (body-file (make-temp-file "arrow-body-" nil ".py"))
+         (_         (with-temp-file body-file (insert body)))
+         (shared-import
+          (if shared-path
+              (concat
+               "import importlib.util as _ilu\n"
+               "_spec = _ilu.spec_from_file_location('_arrow_shared', "
+               (format "%S" shared-path) ")\n"
+               "_mod = _ilu.module_from_spec(_spec)\n"
+               "_spec.loader.exec_module(_mod)\n"
+               "_shared_ns = {k: v for k, v in vars(_mod).items()\n"
+               "              if not k.startswith('_')}\n"
+               "del _ilu, _spec, _mod\n\n")
+            "")))
+    (push body-file arrow--pipeline-tempfiles)
+    (concat
+     shared-import
+     "import dill as _pickle, os as _os, glob as _glob\n\n"
+     "# load all node outputs into `nodes` dict (same as REPL)\n"
+     "_inspect_dir = " (format "%S" dir) "\n"
+     "_nodes = {}\n"
+     "if _inspect_dir and _os.path.isdir(_inspect_dir):\n"
+     "    for _f in sorted(_glob.glob(_os.path.join(_inspect_dir, '*.pkl'))):\n"
+     "        _base = _os.path.basename(_f)\n"
+     "        if _base.endswith('.input.pkl'):\n"
+     "            continue\n"
+     "        _name = _os.path.splitext(_base)[0]\n"
+     "        try:\n"
+     "            with open(_f, 'rb') as _fh:\n"
+     "                _nodes[_name] = _pickle.load(_fh)\n"
+     "        except Exception:\n"
+     "            pass\n\n"
+     "# user block\n"
+     "import sys as _sys\n"
+     "_real_stdout = _sys.stdout\n"
+     "_sys.stdout = _sys.stderr\n"
+     "_ns = {'nodes': _nodes}\n"
+     (if shared-path "_ns.update(_shared_ns)\n" "")
+     (format "with open(%S) as _bf:\n    _body = _bf.read()\n" body-file)
+     "exec(_body, _ns)\n"
+     "_sys.stdout = _real_stdout\n\n"
+     "# serialize output (optional — pipeline blocks may set output or not)\n"
+     "import tempfile\n"
+     "output = _ns.get('output', None)\n"
+     "_out = tempfile.mktemp(suffix='.pkl', prefix='arrow-data-')\n"
+     "with open(_out, 'wb') as _f:\n"
+     "    _pickle.dump(output, _f)\n"
      "import hashlib as _hl\n"
      "with open(_out, 'rb') as _f:\n"
      "    _hash = _hl.sha256(_f.read()).hexdigest()\n"
@@ -2346,9 +2462,12 @@ except Exception:
 
 ;;; ── Entry point (replaces arrow-exec-pipeline) ───────────────────────────────
 
-(defun arrow-exec-pipeline (source-buffer &optional src flow-name)
+(defun arrow-exec-pipeline (source-buffer &optional src flow-name explicit-params)
   "Execute the Arrow pipeline defined in SRC (or the current babel block).
 FLOW-NAME, if non-nil, scopes the inspect directory and REPL buffer.
+EXPLICIT-PARAMS, if non-nil, is the org-babel params alist for the block
+(used when called programmatically via arrow-run so header args like
+:workers are respected even though point is not inside the block).
 Shows live graph visualization in *arrow*.  The execution log is
 available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
   (interactive (list (current-buffer)))
@@ -2363,13 +2482,16 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
                                (forward-line -1)
                                (when (looking-at "[ \t]*#\\+name:[ \t]*\\(.+?\\)[ \t]*$")
                                  (match-string-no-properties 1))))))
-         (params (and info (nth 2 info)))
+         (params (or explicit-params (and info (nth 2 info))))
          (arrow-param (and params (cdr (assq :arrow params))))
-         ;; --- NEW CODE HERE ---
-         (workers-param (and params (cdr (assq :workers params))))
-         (arrow--map-max-workers (if workers-param
-                                     (string-to-number workers-param)
-                                   arrow--map-max-workers)))
+         (workers-param (and params (cdr (assq :workers params)))))
+    ;; Set the global directly so the value survives into async sentinels
+    ;; and run-at-time callbacks, which execute outside this let* scope.
+    (when workers-param
+      (setq arrow--map-max-workers
+            (cond ((integerp workers-param) workers-param)
+                  ((stringp  workers-param) (string-to-number workers-param))
+                  (t arrow--map-max-workers))))
     (when (and arrow-param
                (string-match-p "noblocks" (string-trim arrow-param)))
       (error "Arrow: this block has :arrow noblocks — visual only, not executable"))
@@ -2400,7 +2522,8 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
                   flow))))
       (unless spine-flow
         (error "Arrow: nothing to execute"))
-      ;; Initialise visualisation and pipeline state
+      ;; Initialise cache directory and visualisation state
+      (arrow--cache-init source-buffer)
       (arrow--viz-init src log-buffer flow-name)
       (setq arrow--pipeline-tempfiles nil
             arrow--pipeline-defs      defs)
@@ -2425,7 +2548,13 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
          (arrow--viz-stop-timer)
          (if err
              (arrow--exec-log log-buffer (format "Pipeline error: %s" err) "[error]")
-           (arrow--exec-log log-buffer "Pipeline complete." "[done]"))
+           (arrow--exec-log log-buffer "Pipeline complete." "[done]")
+           ;; Register this pipeline's outputs for :arrow load
+           (when flow-name
+             (puthash flow-name
+                      (cons (copy-hash-table arrow--viz-output)
+                            arrow--shared-module-path)
+                      arrow--pipeline-registry)))
          (arrow--repl-reload)
          (run-at-time 5 nil
            (lambda ()
@@ -2434,13 +2563,13 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
              (setq arrow--pipeline-tempfiles nil))))))))
 
 (defun arrow--find-named-arrow-blocks (buffer)
-  "Return alist of (name . body) for all named arrow src blocks in BUFFER.
+  "Return list of (name body params) for all named arrow src blocks in BUFFER.
 Excludes blocks with :arrow noblocks."
   (with-current-buffer buffer
     (org-with-wide-buffer
      (goto-char (point-min))
      (let ((case-fold-search t)
-           results)
+           (results nil))
        (while (re-search-forward
                "^[ \t]*#\\+name:[ \t]*\\(.+?\\)[ \t]*$" nil t)
          (let ((name (match-string-no-properties 1)))
@@ -2454,7 +2583,7 @@ Excludes blocks with :arrow noblocks."
                      (unless (and arrow-param
                                   (string-match-p "noblocks"
                                                   (string-trim arrow-param)))
-                       (push (cons name (nth 1 info)) results)))))))))
+                       (push (list name (nth 1 info) params) results)))))))))
        (nreverse results)))))
 
 (defun arrow-run (&optional name)
@@ -2470,15 +2599,15 @@ run it; otherwise prompt the user to choose."
            ((= (length blocks) 1)
             (car blocks))
            (name
-            (or (assoc name blocks)
+            (or (cl-find name blocks :key #'car :test #'equal)
                 (error "No arrow block named %s" name)))
            (t
             (let ((picked (completing-read "Run pipeline: "
                                            (mapcar #'car blocks)
                                            nil t)))
-              (assoc picked blocks))))))
+              (cl-find picked blocks :key #'car :test #'equal))))))
     (message "Arrow: running pipeline %s" (car choice))
-    (arrow-exec-pipeline (current-buffer) (cdr choice) (car choice))))
+    (arrow-exec-pipeline (current-buffer) (cadr choice) (car choice) (caddr choice))))
 
 (defun arrow-show-exec-log ()
   "Show the *arrow-exec* log buffer for the current pipeline."
@@ -2688,6 +2817,15 @@ symbols are injected into the namespace.  Call `_reload()` to refresh."
     (let ((proc (get-buffer-process arrow--repl-buffer)))
       (when (and proc (process-live-p proc))
         (comint-send-string proc "_reload()\n")))))
+
+;;; ── Pipeline output registry ─────────────────────────────────────────────────
+;;
+;; Maps flow-name -> snapshot of arrow--viz-output at pipeline completion.
+;; Used by :arrow load to inject node outputs into downstream python blocks.
+
+(defvar arrow--pipeline-registry (make-hash-table :test #'equal)
+  "Hash table: flow-name -> (output-table . shared-module-path).
+Populated when a named pipeline completes successfully.")
 
 ;;; ── Wire reload into viz-store-output ────────────────────────────────────────
 
