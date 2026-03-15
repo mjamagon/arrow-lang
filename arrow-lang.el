@@ -2798,7 +2798,9 @@ injects shared module symbols."
       (insert "print('  _run(\"Name\")   — re-execute a node, all vars in scope')\n")
       (insert "print('  _ls()          — list nodes available for _run')\n")
       (insert "print('  _reload()      — refresh after pipeline re-run')\n")
-      (insert "print('  _clear()       — reset namespace and clear screen')\n"))
+      (insert "print('  _clear()       — reset namespace and clear screen')\n")
+      ;; Self-delete after being sourced — reliable cleanup, no timer race
+      (insert (format "_os.unlink(%S)\n" init)))
     init))
 
 (defun arrow--repl-clear-filter (output)
@@ -2848,8 +2850,7 @@ symbols are injected into the namespace.  Call `_reload()` to refresh."
         (with-current-buffer repl-buf
           (comint-mode)
           (setq-local comint-prompt-regexp "^>>> \\|^\\.\\.\\. ")
-          (add-hook 'comint-output-filter-functions #'arrow--repl-clear-filter nil t)
-          (run-with-timer 5 nil (lambda () (ignore-errors (delete-file init)))))
+          (add-hook 'comint-output-filter-functions #'arrow--repl-clear-filter nil t))
         (setq arrow--repl-buffer repl-buf)
         (pop-to-buffer-same-window repl-buf)))))
 
