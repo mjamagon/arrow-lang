@@ -217,3 +217,15 @@ Python is the primary language (with pickle-based data threading), but blocks ca
 | R | `Rscript` |
 | julia | `julia` |
 | javascript / js | `node` |
+
+
+## Treesitter support
+
+Run the following in your terminal:
+
+``` shell
+tar xzf tree-sitter-arrow.tar.gz
+cd tree-sitter-arrow
+npm install
+./build.sh   # compiles parser.c → ~/.emacs.d/tree-sitter/libtree-sitter-arrow.so
+```
