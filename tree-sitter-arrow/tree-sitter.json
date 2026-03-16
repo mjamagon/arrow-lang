@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "version": "0.1.0",
+    "license": "MIT",
+    "description": "Tree-sitter grammar for the Arrow flowchart language",
+    "authors": [],
+    "links": {
+      "repository": "https://github.com/user/tree-sitter-arrow"
+    }
+  },
+  "grammars": [
+    {
+      "name": "arrow",
+      "camelcase": "Arrow",
+      "scope": "source.arrow",
+      "path": ".",
+      "file-types": ["arrow"],
+      "highlights": "queries/highlights.scm",
+      "injection-regex": "^arrow$"
+    }
+  ]
+}

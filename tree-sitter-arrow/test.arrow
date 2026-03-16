@@ -1,0 +1,7 @@
+-- A simple pipeline
+D > E /Interaction1 > F > (G, G > X /Interaction2) > End
+Interaction1 > Interaction2
+prep := A > B > C
+A > B >? C
+A > B* > C
+Node1 # > Node2 !
