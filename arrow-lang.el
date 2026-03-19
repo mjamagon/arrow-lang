@@ -47,6 +47,11 @@
 ;;          input as a dict keyed by source node names.  Fork-join
 ;;          targets also receive dicts keyed by branch terminal names.
 ;;   A > B* > C          parallel map: apply B to each element of A's output list
+;;
+;; Header arguments:
+;;   :workers N           max concurrent map workers (default 6)
+;;   :lenient yes         continue on error in map/fork — failed elements
+;;                        become None instead of aborting the pipeline
 
 ;;; ─── Pre-processing ──────────────────────────────────────────────────────────
 
@@ -953,6 +958,12 @@ The file is copied to the inspect directory so it persists for the REPL."
   "Maximum number of concurrent subprocesses spawned by a parallel map fork.
 Can be overridden per-pipeline by the :workers header argument on the arrow block.")
 
+(defvar arrow--lenient nil
+  "When non-nil, map forks and parallel forks continue on error.
+Failed elements produce None in the output list/dict instead of
+aborting the pipeline.  Set per-pipeline by the :lenient header
+argument on the arrow block (any truthy value, e.g. :lenient yes).")
+
 (defvar arrow--interpreters
   '(("python"     . "python3")
     ("python3"    . "python3")
@@ -1245,6 +1256,45 @@ try:
     import dill as pickle, hashlib
     items = [%s]
     data = {name: pickle.load(open(p,'rb')) for name, p in items}
+    with open(%S,'wb') as f: pickle.dump(data, f)
+    with open(%S,'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+    print(%S)
+    print(h)
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    sys.exit(1)
+" items-repr out-path out-path out-path)))
+
+(defun arrow--lenient-merge-script-body (paths-repr out-path)
+  "Like `arrow--merge-script-body' but tolerates None entries in the paths list.
+None entries (from failed map elements) become None in the output list."
+  (format "import sys, traceback
+try:
+    import dill as pickle, hashlib
+    paths = [%s]
+    data = [pickle.load(open(p,'rb')) if p is not None else None for p in paths]
+    with open(%S,'wb') as f: pickle.dump(data, f)
+    with open(%S,'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
+    print(%S)
+    print(h)
+except Exception:
+    traceback.print_exc(file=sys.stdout)
+    sys.exit(1)
+" paths-repr out-path out-path out-path))
+
+(defun arrow--lenient-dict-merge-script-body (names-and-paths out-path)
+  "Like `arrow--dict-merge-script-body' but tolerates None pickle paths.
+Failed branches become None values in the output dict."
+  (let ((items-repr (mapconcat
+                     (lambda (pair)
+                       (format "(%S, %s)" (car pair)
+                               (if (cdr pair) (format "%S" (cdr pair)) "None")))
+                     names-and-paths ", ")))
+    (format "import sys, traceback
+try:
+    import dill as pickle, hashlib
+    items = [%s]
+    data = {name: (pickle.load(open(p,'rb')) if p is not None else None) for name, p in items}
     with open(%S,'wb') as f: pickle.dump(data, f)
     with open(%S,'rb') as f: h = hashlib.sha256(f.read()).hexdigest()
     print(%S)
@@ -1579,7 +1629,15 @@ Fails fast: if any element errors, pending elements are cancelled and CALLBACK r
                                             (funcall arrow--viz-map-hook name (car done-c) n))
                                           
                                           ;; Fast-fail: clear pending queue on error
-                                          (if err (setq queue nil))
+                                          ;; (unless :lenient mode is active)
+                                          (when (and err (not arrow--lenient))
+                                            (setq queue nil))
+                                          
+                                          (when err
+                                            (arrow--exec-log log-buffer
+                                                             (format "%s*[%d] — %s%s" name idx err
+                                                                     (if arrow--lenient " (continuing)" ""))
+                                                             (if arrow--lenient "[warn]" "[error]")))
                                           
                                           ;; Free the slot before any further action
                                           (cl-decf active-workers)
@@ -1587,15 +1645,27 @@ Fails fast: if any element errors, pending elements are cancelled and CALLBACK r
                                           (if (= (car done-c) n)
                                               ;; We are the final worker to finish -> Merge!
                                               (let ((first-err (cl-find-if #'identity (append errors nil))))
-                                                (if first-err
+                                                (if (and first-err (not arrow--lenient))
                                                     (funcall callback nil first-err)
+                                                  ;; In lenient mode, replace failed items with
+                                                  ;; a None pickle so downstream gets a clean list
+                                                  (when (and first-err arrow--lenient)
+                                                    (arrow--exec-log log-buffer
+                                                                     (format "%s* — %d/%d elements failed (lenient: substituting None)"
+                                                                             name
+                                                                             (cl-count-if #'identity (append errors nil))
+                                                                             n)
+                                                                     "[warn]"))
                                                   (let* ((items        (append results nil))
                                                          (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
                                                          (merge-script (make-temp-file "arrow-mmap-" nil ".py"))
-                                                         (paths-repr   (mapconcat (lambda (p) (format "%S" p)) items ", "))
+                                                         (paths-repr   (mapconcat
+                                                                        (lambda (p)
+                                                                          (if p (format "%S" p) "None"))
+                                                                        items ", "))
                                                          (mb (generate-new-buffer " *arrow-mmap*")))
                                                     (with-temp-file merge-script
-                                                      (insert (arrow--merge-script-body paths-repr merge-out)))
+                                                      (insert (arrow--lenient-merge-script-body paths-repr merge-out)))
                                                     (push merge-out arrow--pipeline-tempfiles)
                                                     (make-process
                                                      :name    "arrow-mmap-merge"
@@ -1605,7 +1675,8 @@ Fails fast: if any element errors, pending elements are cancelled and CALLBACK r
                                                                  (arrow--merge-sentinel
                                                                   mp mev merge-script mb merge-out callback
                                                                   log-buffer
-                                                                  (format "%s* -- collected %d results" name n)))))))
+                                                                  (format "%s* -- collected %d results (%d failed)" name n
+                                                                          (cl-count-if #'identity (append errors nil)))))))))
                                             ;; Not final yet: spawn next job from queue
                                             (funcall spawn-next)))))
                                    
@@ -1803,6 +1874,42 @@ Calls CALLBACK with (merge-out nil) or (nil err)."
                                            (if (string-empty-p detail) "no output" detail)
                                            200 nil nil "...")))))))))))
 
+(defun arrow--run-lenient-dict-merge (names-and-paths callback log-buffer)
+  "Like `arrow--run-dict-merge' but tolerates nil pickle paths.
+Failed branches (where cdr is nil) become None in the output dict."
+  (let* ((merge-script (make-temp-file "arrow-merge-" nil ".py"))
+         (merge-out    (make-temp-file "arrow-data-" nil ".pkl"))
+         (proc-buf     (generate-new-buffer " *arrow-merge*"))
+         (nap          names-and-paths))
+    (with-temp-file merge-script
+      (insert (arrow--lenient-dict-merge-script-body nap merge-out)))
+    (push merge-out arrow--pipeline-tempfiles)
+    (make-process
+     :name    "arrow-merge"
+     :buffer  proc-buf
+     :command (list "python3" merge-script)
+     :sentinel (lambda (proc event)
+                 (when (string-match-p "finished\\|exited" event)
+                   (ignore-errors (delete-file merge-script))
+                   (let ((raw (with-current-buffer proc-buf (buffer-string))))
+                     (ignore-errors (kill-buffer proc-buf))
+                     (if (= (process-exit-status proc) 0)
+                         (progn
+                           (when log-buffer
+                             (arrow--exec-log log-buffer
+                                              (format "fork merge (lenient, %d/%d succeeded)"
+                                                      (cl-count-if #'cdr nap)
+                                                      (length nap))
+                                              "[done]"))
+                           (funcall callback merge-out nil))
+                       (let ((detail (string-trim raw)))
+                         (funcall callback nil
+                                  (format "fork merge failed (exit %d): %s"
+                                          (process-exit-status proc)
+                                          (truncate-string-to-width
+                                           (if (string-empty-p detail) "no output" detail)
+                                           200 nil nil "...")))))))))))
+
 (defun arrow--exec-and-fork (branches input source-buffer log-buffer callback
                             &optional ctx)
   "Run all BRANCHES in parallel; wait for all.
@@ -1835,19 +1942,21 @@ CTX, when non-nil, is a map-element context for secondary arrow support."
                        (setcar done-c (1+ (car done-c)))
                        (when (= (car done-c) n)
                          (let ((first-err (cl-find-if #'identity (append errors nil))))
-                           (if first-err
+                           (if (and first-err (not arrow--lenient))
                                (funcall callback nil first-err)
                              (let* ((items    (append results nil))
                                     (all-pkl  (cl-every
                                                (lambda (r)
-                                                 (and (stringp r)
-                                                      (string-suffix-p ".pkl" r)
-                                                      (file-exists-p r)))
+                                                 (or (null r)  ; lenient: failed branch
+                                                     (and (stringp r)
+                                                          (string-suffix-p ".pkl" r)
+                                                          (file-exists-p r))))
                                                items)))
                                (if all-pkl
-                                   (arrow--run-dict-merge
-                                    (cl-mapcar #'cons branch-names items)
-                                    callback log-buffer)
+                                   (let ((pairs (cl-mapcar #'cons branch-names items)))
+                                     (if (and first-err arrow--lenient)
+                                         (arrow--run-lenient-dict-merge pairs callback log-buffer)
+                                       (arrow--run-dict-merge pairs callback log-buffer)))
                                  (funcall callback
                                           (concat "{"
                                                   (mapconcat
@@ -1898,19 +2007,21 @@ CTX, when non-nil, is a map-element context for secondary arrow support."
                        (setcar done-c (1+ (car done-c)))
                        (when (= (car done-c) n)
                          (let ((first-err (cl-find-if #'identity (append errors nil))))
-                           (if first-err
+                           (if (and first-err (not arrow--lenient))
                                (funcall callback nil first-err)
                              (let* ((items    (append results nil))
                                     (all-pkl  (cl-every
                                                (lambda (r)
-                                                 (and (stringp r)
-                                                      (string-suffix-p ".pkl" r)
-                                                      (file-exists-p r)))
+                                                 (or (null r)  ; lenient: failed branch
+                                                     (and (stringp r)
+                                                          (string-suffix-p ".pkl" r)
+                                                          (file-exists-p r))))
                                                items)))
                                (if all-pkl
-                                   (arrow--run-dict-merge
-                                    (cl-mapcar #'cons branch-names items)
-                                    callback log-buffer)
+                                   (let ((pairs (cl-mapcar #'cons branch-names items)))
+                                     (if (and first-err arrow--lenient)
+                                         (arrow--run-lenient-dict-merge pairs callback log-buffer)
+                                       (arrow--run-dict-merge pairs callback log-buffer)))
                                  (funcall callback
                                           (concat "{"
                                                   (mapconcat
@@ -2526,7 +2637,8 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
                                  (match-string-no-properties 1))))))
          (params (or explicit-params (and info (nth 2 info))))
          (arrow-param (and params (cdr (assq :arrow params))))
-         (workers-param (and params (cdr (assq :workers params)))))
+         (workers-param (and params (cdr (assq :workers params))))
+         (lenient-param (and params (cdr (assq :lenient params)))))
     ;; Set the global directly so the value survives into async sentinels
     ;; and run-at-time callbacks, which execute outside this let* scope.
     (when workers-param
@@ -2534,6 +2646,12 @@ available in *arrow-exec* via \\[arrow-show-exec-log] (C-c C-l in *arrow*)."
             (cond ((integerp workers-param) workers-param)
                   ((stringp  workers-param) (string-to-number workers-param))
                   (t arrow--map-max-workers))))
+    (setq arrow--lenient
+          (and lenient-param
+               (not (member (if (stringp lenient-param)
+                                (downcase (string-trim lenient-param))
+                              "")
+                            '("no" "nil" "false" "0" "")))))
     (when (and arrow-param
                (string-match-p "noblocks" (string-trim arrow-param)))
       (error "Arrow: this block has :arrow noblocks — visual only, not executable"))
@@ -2901,6 +3019,78 @@ Populated when a named pipeline completes successfully.")
 
 (arrow--setup-arrow-buffer-keys (get-buffer-create "*arrow*"))
 
+;;; ── Export ───────────────────────────────────────────────────────────────────
+
+(defun arrow-export (filename)
+  "Export all node outputs to a zip-of-pickles file.
+Prompts for FILENAME and appends .zip automatically.  Each node
+output from the current pipeline becomes a separate entry (Name.pkl)
+inside the zip, serialised with dill.  This gives you a single
+portable file with selective loading:
+
+  import zipfile, dill
+  with zipfile.ZipFile(\"export.zip\") as zf:
+      with zf.open(\"SomeNode.pkl\") as f:
+          data = dill.load(f)
+
+Requires the pipeline to have been run (so that the inspect
+directory is populated with .pkl files)."
+  (interactive
+   (let ((proj-dir (if arrow--cache-dir
+                       (file-name-directory (directory-file-name arrow--cache-dir))
+                     default-directory)))
+     (list (read-file-name "Export nodes to: "
+                           proj-dir "arrow-export" nil "arrow-export"))))
+  ;; Ensure .zip extension
+  (unless (string-suffix-p ".zip" filename)
+    (setq filename (concat filename ".zip")))
+  ;; Validate state
+  (unless arrow--viz-inspect-dir
+    (user-error "No pipeline output — run the pipeline first"))
+  (unless (file-directory-p arrow--viz-inspect-dir)
+    (user-error "Inspect directory does not exist: %s" arrow--viz-inspect-dir))
+  (let* ((pkl-files (directory-files arrow--viz-inspect-dir t "\\.pkl\\'"))
+         ;; Filter out .input.pkl files — those are node inputs, not outputs
+         (pkl-files (cl-remove-if
+                     (lambda (f) (string-suffix-p ".input.pkl" f))
+                     pkl-files))
+         (dest (expand-file-name filename))
+         (script (make-temp-file "arrow-export-" nil ".py")))
+    (unless pkl-files
+      (user-error "No node output .pkl files found in %s" arrow--viz-inspect-dir))
+    ;; Write a small Python script that zips the pkl files
+    (with-temp-file script
+      (insert "import zipfile, os, sys\n")
+      (insert (format "dest = %S\n" dest))
+      (insert (format "src_dir = %S\n" arrow--viz-inspect-dir))
+      (insert "pkls = [f for f in sorted(os.listdir(src_dir))\n")
+      (insert "        if f.endswith('.pkl') and not f.endswith('.input.pkl')]\n")
+      (insert "with zipfile.ZipFile(dest, 'w', zipfile.ZIP_DEFLATED) as zf:\n")
+      (insert "    for f in pkls:\n")
+      (insert "        zf.write(os.path.join(src_dir, f), f)\n")
+      (insert "print(f'Exported {len(pkls)} nodes to {dest}')\n"))
+    ;; Run the script asynchronously with a sentinel for feedback
+    (let ((buf (generate-new-buffer " *arrow-export*")))
+      (make-process
+       :name "arrow-export"
+       :buffer buf
+       :command (list "python3" script)
+       :sentinel
+       (lambda (proc event)
+         (unwind-protect
+             (let ((exit-code (process-exit-status proc)))
+               (if (zerop exit-code)
+                   (message "Arrow: exported %d node%s to %s"
+                            (length pkl-files)
+                            (if (= (length pkl-files) 1) "" "s")
+                            dest)
+                 (message "Arrow export failed (exit %d): %s"
+                          exit-code
+                          (with-current-buffer buf
+                            (string-trim (buffer-string))))))
+           (ignore-errors (delete-file script))
+           (kill-buffer buf)))))))
+
 ;;; ── Pipeline kill ────────────────────────────────────────────────────────────
 
 (defun arrow-kill ()
@@ -2935,7 +3125,8 @@ and marks any in-flight nodes as :error in the visualisation."
     (setq arrow--pipeline-tempfiles nil)
     ;; 5. Reset in-flight scheduling state
     (setq arrow--viz-map-hook nil
-          arrow--map-saw-miss nil)
+          arrow--map-saw-miss nil
+          arrow--lenient nil)
     ;; 6. Log and report
     (when (buffer-live-p arrow--viz-log-buffer)
       (arrow--exec-log arrow--viz-log-buffer
